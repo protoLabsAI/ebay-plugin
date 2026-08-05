@@ -1,0 +1,5 @@
+# Test-only deps. At runtime langchain-core is provided by the host (protoAgent);
+# these let the suite run standalone in CI with no host present.
+langchain-core>=0.2
+pyyaml>=6
+pytest>=8

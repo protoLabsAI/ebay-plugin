@@ -1,0 +1,52 @@
+id: ebay
+name: eBay (price research via browser)
+version: 0.1.0
+description: >-
+  Pricing research on eBay — what an item actually SOLD for, not just what sellers are
+  asking. Returns median/quartile statistics plus the underlying listings, so a pricing
+  decision rests on numbers rather than impressions.
+
+  Driven through a real signed-in browser (the `agent-browser` CLI), not the eBay API: the
+  sold-comps data lives behind eBay's Marketplace Insights API, which is Limited Release and
+  closed to new applicants, while the same data is plainly visible in the web UI to a
+  signed-in user. Consequences: the browser must be HEADED with a persistent profile (eBay
+  serves headless browsers an error page), and you sign in by hand once — the profile keeps
+  you signed in. No API keys, and this plugin never handles your credentials.
+
+  Requires the `agent-browser` binary on PATH (`npm i -g agent-browser && agent-browser
+  install`). Ships DISABLED; enable with `plugins: { enabled: [ebay] }`.
+enabled: false
+repository: https://github.com/protoLabsAI/ebay-plugin
+min_protoagent_version: "0.27.0"
+
+config_section: ebay
+config:
+  # The agent-browser CLI on PATH (override for a pinned path).
+  binary: agent-browser
+  # Named browser session, so eBay work doesn't fight another plugin over the default one.
+  session: ebay
+  # Persistent browser-profile dir — this is what keeps you signed in to eBay between runs.
+  # Blank means no profile, which means signing in every session and losing the sold view.
+  # NOTE: profile/headed are DAEMON-level launch options. If a browser daemon is already
+  # running under different options the CLI silently ignores these, so the plugin raises
+  # instead of browsing as the wrong identity. `agent-browser close --all` then retry.
+  profile: ""
+  # eBay refuses headless browsers with an error page. Leave this on.
+  headed: true
+  # Marketplace domain — www.ebay.co.uk, www.ebay.de, … for a non-US market.
+  domain: www.ebay.com
+  # Per-command subprocess timeout (seconds).
+  timeout_s: 60
+  # Minimum gap between navigations. Politeness, not evasion: it keeps a research loop from
+  # hitting the site faster than a person would. Raise it if eBay starts serving challenges.
+  min_interval_s: 1.5
+  # Cap on listings returned by one call (a results page holds ~60).
+  max_results: 60
+
+capabilities:
+  # Declarative only (ADR 0071) — stated so the install review is honest about blast radius.
+  # The browser subprocess is outside protoAgent's in-process egress fence (ADR 0008): a
+  # browser it drives can reach any site the profile can.
+  network: ["www.ebay.com", "*.ebay.com"]
+  filesystem: scoped   # the browser profile dir only
+  subprocess: true     # shells out to the agent-browser CLI
