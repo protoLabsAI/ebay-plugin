@@ -29,6 +29,7 @@ import json
 import logging
 import time
 
+from . import amazon
 from .browser import Browser, BrowserError
 from .extract import RESULT_JS, SESSION_JS, normalize, search_url, summarize
 from .fees import Costs, breakeven_price, net_proceeds, schedule_from_config
@@ -38,6 +39,19 @@ log = logging.getLogger("protoagent.plugins.ebay")
 #: Rows returned inline to the model. The full set still drives the statistics — this caps
 #: only what lands in the context window (ADR 0005).
 _SAMPLE = 8
+
+
+def _default_history_db() -> str:
+    """Per-instance path for the observation log. Resolved through the host when there is
+    one; a plain home-relative path otherwise, so the module imports with no host present."""
+    try:
+        from infra.paths import instance_paths
+
+        return str(instance_paths().store("marketplace") / "prices.db")
+    except Exception:  # noqa: BLE001 — host-free (tests, CLI): fall back to a home path
+        from pathlib import Path
+
+        return str(Path("~/.protoagent/marketplace-prices.db").expanduser())
 
 
 class EbayError(RuntimeError):
@@ -61,6 +75,58 @@ def _is_undecided(data) -> bool:
     return isinstance(data, dict) and not any(
         (data.get("count"), data.get("found_container"), data.get("signin_wall"), data.get("challenge"))
     )
+
+
+#: Amazon's equivalent of the eBay results container.
+_AMAZON_SELECTOR = 'div[data-component-type="s-search-result"]'
+
+
+def _classify(data, url: str, *, marketplace: str) -> None:
+    """Raise the right error for a page that carries no results. Shared by both sources
+    because both gate the same three ways — sign-in, bot check, or a page we can't read —
+    and all three arrive as a card-less DOM."""
+    if data.get("signin_wall"):
+        raise EbayError(
+            f"{marketplace} redirected to its sign-in page. Run the session-status tool, sign in "
+            "once in the browser window, and retry. The profile keeps you signed in after that."
+        )
+    if data.get("challenge"):
+        raise EbayError(
+            f"{marketplace} is asking for human verification (a CAPTCHA / bot check) instead of "
+            "returning results. Complete it in the browser window, then retry — this plugin "
+            "deliberately hands that to you rather than trying to work around it. If it keeps "
+            "recurring, raise min_interval_s to slow the search cadence."
+        )
+    if not data.get("found_container"):
+        landed = str(data.get("url") or "").strip()
+        where = f" The browser ended up at: {landed}" if landed and landed not in url else ""
+        raise EbayError(
+            f"could not find the results list on the {marketplace} page — either it changed its "
+            "markup (a plugin bug) or it sent the browser somewhere unexpected. Either way this "
+            "is NOT an empty search, and reporting zero results would read as 'nothing "
+            f"matches'.{where} Run the page-probe tool on the URL for the details."
+        )
+
+
+def _read(browser: Browser, url: str, script: str, selector: str):
+    """Navigate, wait for results, and re-read while the page is still mid-redirect."""
+    browser.open(url)
+    browser.wait_for(selector)
+    data = browser.eval_json(script)
+    for _ in range(_SETTLE_TRIES):
+        if not _is_undecided(data):
+            break
+        time.sleep(_SETTLE_S)
+        data = browser.eval_json(script)
+    if not isinstance(data, dict):
+        raise EbayError(f"unexpected response while reading {url}")
+    return data
+
+
+def _fetch_amazon(browser: Browser, url: str):
+    data = _read(browser, url, amazon.RESULT_JS, _AMAZON_SELECTOR)
+    _classify(data, url, marketplace="Amazon")
+    return amazon.normalize(data.get("rows") or [])
 
 
 def _fetch(browser: Browser, url: str, *, sold: bool):
@@ -164,6 +230,7 @@ def build_tools(cfg: dict):
 
         cap = limit if limit and limit > 0 else max_results
         listings = listings[:cap]
+        _record(query, "ebay", listings)
         stats = summarize(listings)
         return json.dumps(
             {
@@ -417,6 +484,172 @@ def build_tools(cfg: dict):
             }
         )
 
+    amazon_domain = cfg.get("amazon_domain") or "www.amazon.com"
+
+    def _history():
+        """The observation log, or None if it can't be opened — history is a nice-to-have and
+        must never take a price check down with it."""
+        try:
+            from .history import PriceHistory
+
+            return PriceHistory(cfg.get("history_db") or _default_history_db())
+        except Exception:  # noqa: BLE001
+            log.exception("[ebay] price history unavailable")
+            return None
+
+    def _record(key: str, source: str, listings) -> None:
+        if (h := _history()) is not None:
+            try:
+                h.record(key, source, listings)
+            except Exception:  # noqa: BLE001
+                log.exception("[ebay] recording price history failed")
+
+    @tool
+    def amazon_price_check(query: str, sort: str = "relevance", limit: int = 0) -> str:
+        """What is this item selling for on Amazon right now? Returns median/quartile statistics plus a sample of listings.
+
+        These are ASKING prices — Amazon publishes no sold history, so nothing here says what
+        buyers actually paid. Use eBay's sold comps for that. Sponsored placements are flagged
+        and excluded from the statistics: an ad is what a seller paid to be shown, not what
+        the market charges.
+        """
+        b = _browser()
+        try:
+            url = amazon.search_url(query, domain=amazon_domain, sort=sort)
+            listings, dropped = _fetch_amazon(b, url)
+        except (BrowserError, EbayError, ValueError) as exc:
+            return json.dumps({"ok": False, "error": str(exc)})
+
+        cap = limit if limit and limit > 0 else max_results
+        listings = listings[:cap]
+        _record(query, "amazon", listings)
+        return json.dumps(
+            {
+                "ok": True,
+                "query": query,
+                "source": "amazon",
+                "basis": "active Amazon listings — asking prices (Buy Box), NOT sale prices",
+                "url": url,
+                "stats": summarize(listings),
+                "results_found": len(listings),
+                "unparseable_rows_skipped": dropped,
+                "sample": [x.as_dict() for x in listings[:_SAMPLE]],
+            }
+        )
+
+    @tool
+    def price_history(query: str, days: int = 90, source: str = "", check_now: bool = True) -> str:
+        """Where today's price sits against what we've recorded before. Use for "is this cheap right now?".
+
+        IMPORTANT — this history is SELF-RECORDED. Amazon publishes no price history, and the
+        services that reconstruct one are paid third parties, so this plugin logs what it sees
+        on every price check and reads that back. There is no data from before you enabled it,
+        and a gap in the record means nobody searched, not that the price held steady. Say so
+        rather than implying a continuous series.
+
+        source: "amazon", "ebay", or blank for both. check_now=True takes a fresh Amazon
+        reading first so the comparison includes today.
+        """
+        h = _history()
+        if h is None:
+            return json.dumps({"ok": False, "error": "the price-history store could not be opened"})
+
+        current = None
+        fresh_error = ""
+        if check_now:
+            try:
+                listings, _ = _fetch_amazon(_browser(), amazon.search_url(query, domain=amazon_domain))
+                _record(query, "amazon", listings)
+                if stats := summarize(listings):
+                    current = stats.get("median")
+            except (BrowserError, EbayError, ValueError) as exc:
+                # Reported, not swallowed: a history summary that silently excludes today
+                # would answer "is this cheap NOW?" without today's price in it.
+                fresh_error = str(exc)
+
+        from .history import position
+
+        hist = h.summary(query, days=days, source=source or "")
+        if current is None and hist.get("observations"):
+            current = hist.get("median")
+        return json.dumps(
+            {
+                "ok": True,
+                "query": query,
+                "source": source or "all",
+                "history": hist,
+                "position": position(current, hist),
+                "caveat": (
+                    "Self-recorded history: nothing before this plugin was enabled, and gaps mean "
+                    "nobody searched, not that the price was stable."
+                ),
+                **({"fresh_reading_failed": fresh_error} if fresh_error else {}),
+            }
+        )
+
+    @tool
+    def compare_prices(query: str, condition: str = "any") -> str:
+        """Compare what an item goes for across eBay and Amazon in one call. Use when asked where something is cheapest, or what the market looks like overall.
+
+        Returns eBay SOLD comps (what buyers paid), eBay ACTIVE and Amazon ACTIVE (what
+        sellers are asking) side by side, each labelled with its basis. These are different
+        kinds of number and are never averaged together — the sold figure is the one to price
+        against; the asking figures say what a new listing would sit beside.
+
+        A source that fails reports its reason instead of silently dropping out, so a
+        one-sided comparison can never be mistaken for a complete one.
+        """
+        b = _browser()
+        out: dict = {"ok": True, "query": query, "sources": {}}
+
+        def _run(key, basis, fetch):
+            try:
+                listings, dropped = fetch()
+                # Record here too. Only the single-source checks logged at first, so the
+                # comparison — the tool most likely to be run repeatedly on a watched item —
+                # built no history at all.
+                _record(query, "amazon" if key.startswith("amazon") else "ebay", listings)
+                out["sources"][key] = {
+                    "ok": True,
+                    "basis": basis,
+                    "stats": summarize(listings),
+                    "results_found": len(listings),
+                    "unparseable_rows_skipped": dropped,
+                    "sample": [x.as_dict() for x in listings[:3]],
+                }
+            except (BrowserError, EbayError, ValueError) as exc:
+                # Named, not omitted: a missing source that looks like an absent one turns a
+                # half-answer into a confident whole one.
+                out["sources"][key] = {"ok": False, "error": str(exc), "basis": basis}
+
+        _run(
+            "ebay_sold",
+            "eBay sold listings — what buyers actually paid",
+            lambda: _fetch(b, search_url(query, domain=domain, sold=True, condition=condition), sold=True),
+        )
+        _run(
+            "ebay_active",
+            "eBay active listings — asking prices",
+            lambda: _fetch(b, search_url(query, domain=domain, sold=False, condition=condition), sold=False),
+        )
+        _run(
+            "amazon_active",
+            "Amazon active listings — asking prices (Buy Box)",
+            lambda: _fetch_amazon(b, amazon.search_url(query, domain=amazon_domain)),
+        )
+
+        ok_sources = [k for k, v in out["sources"].items() if v.get("ok")]
+        out["note"] = (
+            "Sold and asking prices are different measures and are deliberately not combined. "
+            "Price against the sold figure; read the asking figures as the competition."
+        )
+        if not ok_sources:
+            out["ok"] = False
+            out["error"] = "every source failed — see sources for the individual reasons"
+        elif len(ok_sources) < 3:
+            out["partial"] = f"only {len(ok_sources)} of 3 sources returned data"
+        return json.dumps(out)
+
     return [
         ebay_price_check,
         ebay_price_and_profit,
@@ -425,4 +658,7 @@ def build_tools(cfg: dict):
         ebay_search,
         ebay_session_status,
         ebay_page_probe,
+        amazon_price_check,
+        compare_prices,
+        price_history,
     ]

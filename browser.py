@@ -205,7 +205,14 @@ def _parse_cli_json(stdout: str):
             payload = json.loads(text)
         except json.JSONDecodeError:
             raise BrowserError(f"could not parse the page script's output: {text[:200]}") from None
-    if isinstance(payload, dict) and "result" in payload:
+    # The CLI's --json envelope is {"success": true, "data": {"origin": ..., "result": <value>},
+    # "error": null} — the payload is nested under `data`, NOT at the top level. Unwrapping only
+    # a top-level "result" handed callers the whole envelope, whose .get("found_container") is
+    # None, so EVERY live search reported "couldn't find the results list" while the page had
+    # loaded perfectly. It looked like rate limiting for a while; it was this.
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict) and "result" in payload["data"]:
+        payload = payload["data"]["result"]
+    elif isinstance(payload, dict) and "result" in payload:
         payload = payload["result"]
     if isinstance(payload, str):
         # A page script that returned a plain string (not JSON) is legitimate — hand it back

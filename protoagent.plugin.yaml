@@ -1,10 +1,11 @@
 id: ebay
-name: eBay (price research via browser)
-version: 0.1.0
+name: Marketplace prices (eBay + Amazon, via browser)
+version: 0.2.0
 description: >-
-  Pricing research on eBay — what an item actually SOLD for, not just what sellers are
-  asking. Returns median/quartile statistics plus the underlying listings, so a pricing
-  decision rests on numbers rather than impressions.
+  Price research across eBay and Amazon — what an item actually SOLD for on eBay, what it
+  is being asked on both, and where today's price sits against what we've recorded before.
+  Returns median/quartile statistics plus the underlying listings, and nets a sale out
+  after eBay's fees, so a pricing decision rests on numbers rather than impressions.
 
   Driven through a real signed-in browser (the `agent-browser` CLI), not the eBay API: the
   sold-comps data lives behind eBay's Marketplace Insights API, which is Limited Release and
@@ -33,8 +34,14 @@ config:
   profile: ""
   # eBay refuses headless browsers with an error page. Leave this on.
   headed: true
-  # Marketplace domain — www.ebay.co.uk, www.ebay.de, … for a non-US market.
+  # Marketplace domains — www.ebay.co.uk / www.amazon.co.uk … for a non-US market.
   domain: www.ebay.com
+  amazon_domain: www.amazon.com
+  # Local price-observation log. Every check appends to it, and price_history reads it
+  # back. Blank = the per-instance default. There is NO retrospective data: Amazon
+  # publishes no history and the services that reconstruct one are paid third parties,
+  # so this accumulates only from the day the plugin is enabled.
+  history_db: ""
   # Per-command subprocess timeout (seconds).
   timeout_s: 60
   # Minimum gap between navigations. Politeness, not evasion: it keeps a research loop from
@@ -47,6 +54,6 @@ capabilities:
   # Declarative only (ADR 0071) — stated so the install review is honest about blast radius.
   # The browser subprocess is outside protoAgent's in-process egress fence (ADR 0008): a
   # browser it drives can reach any site the profile can.
-  network: ["www.ebay.com", "*.ebay.com"]
+  network: ["*.ebay.com", "*.amazon.com"]
   filesystem: scoped   # the browser profile dir only
   subprocess: true     # shells out to the agent-browser CLI

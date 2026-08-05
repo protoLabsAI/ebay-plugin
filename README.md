@@ -1,6 +1,6 @@
-# ebay-plugin
+# marketplace price plugin (eBay + Amazon)
 
-Pricing research on eBay for [protoAgent](https://github.com/protoLabsAI/protoAgent) — **what an
+Price research for [protoAgent](https://github.com/protoLabsAI/protoAgent) — **what an
 item actually sold for**, and **what you'd keep after fees**.
 
 ```
@@ -28,7 +28,7 @@ hand, once, in a browser window.
 |---|---|
 | **Sign-in required** | eBay serves the sold view only to signed-in users. |
 | **Headed only** | eBay answers headless browsers with an error page. |
-| **Rate-limited** | Hit it hard and eBay serves verification pages or results-less pages for a while. `min_interval_s` paces requests; raise it if that happens. |
+| **Rate-limited** | Hit either site hard and you get verification pages. `min_interval_s` paces requests; raise it if that happens. |
 | **Markup isn't a contract** | Selectors were verified live and will eventually break. The tools distinguish "no results" from "couldn't read the page" and report the second as a bug. |
 
 This plugin makes **no attempt to defeat bot detection** — no proxy rotation, no fingerprint
@@ -50,6 +50,7 @@ ebay:
   profile: ~/.protoagent/ebay-profile   # REQUIRED — this is what keeps you signed in
   headed: true
   domain: www.ebay.com                  # www.ebay.co.uk, www.ebay.de, …
+  amazon_domain: www.amazon.com
 ```
 
 Then ask the agent to run `ebay_session_status`, and **sign in once** in the window that
@@ -71,9 +72,16 @@ opens. The profile persists it.
 | `ebay_search` | Individual listings — competitor titles, what's bundled. |
 | `ebay_session_status` | Signed in? Run this first when something reports a sign-in wall. |
 | `ebay_page_probe` | Diagnostic: what the extractor sees on a page. For when markup changes. |
+| `amazon_price_check` | Amazon asking prices. Sponsored rows are flagged and kept out of the statistics. |
+| `compare_prices` | eBay sold + eBay active + Amazon active, side by side, each labelled with its basis. |
+| `price_history` | Where today's price sits against what we've recorded before. |
 
 A bundled `ebay-pricing` skill teaches the agent how to narrow a query until the comps are
 actually comparable, and how to report a price *with its basis*.
+
+**Amazon is not a comp source.** It publishes asking prices only — the Buy Box, one offer
+among several. eBay's sold view is the only real sale data here, and every result is
+labelled so the two can never be reported as the same kind of number.
 
 ## Fees
 
@@ -105,11 +113,15 @@ provided for sales taken *outside* eBay.
 
 ## What this does NOT do
 
-- **No Amazon.** Amazon's Product Advertising API is deprecated and returns `403`; its
-  replacement (Creators API) requires an Associates account with qualifying referred sales.
-  There's no Amazon data here, and the skill tells the agent to say so rather than reason
-  about Amazon from memory. The tool layer is source-agnostic, so a provider can be added
-  without redesign.
+- **No Amazon SOLD data.** Amazon publishes asking prices only — nothing there says what
+  buyers actually paid. eBay's sold comps are the only real sale data in this plugin, and the
+  tools label which is which so the two can't be confused. (Amazon's Product Advertising API
+  is deprecated and returns `403`; its replacement needs an Associates account with
+  qualifying referred sales, so the browser is the only route.)
+- **No retrospective price history.** `price_history` reads a log this plugin writes itself,
+  so it starts empty and accumulates from the day you enable it. Gaps mean nobody searched,
+  not that the price held steady. Reconstructing history before that needs a paid third party
+  (Keepa and similar).
 - **No listing management.** Nothing here publishes a listing, changes a live price, contacts
   a buyer or touches an order. Seller-side automation is deliberately deferred until the
   Seller Hub markup can be verified against a signed-in session — guessing at it is precisely
@@ -120,7 +132,7 @@ provided for sales taken *outside* eBay.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 77 tests, no protoAgent host and no browser required
+pytest -q          # 114 tests, no protoAgent host and no browser required
 ruff check . && ruff format --check .
 ```
 

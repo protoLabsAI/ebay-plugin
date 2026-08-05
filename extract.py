@@ -137,8 +137,16 @@ class Listing:
     condition: str
     sold_date: str
     #: True only for rows pulled from the sold/completed view. Callers surface this so an
-    #: asking price is never reported as a sale price.
+    #: asking price is never reported as a sale price. Always False off eBay — no other
+    #: marketplace here publishes what things actually sold for.
     sold: bool
+    #: Which marketplace this row came from. Rows from different sources routinely sit in one
+    #: list, and a price is only interpretable next to where it was quoted.
+    source: str = "ebay"
+    rating: float | None = None
+    #: Paid placement. Excluded from statistics — an ad is what a seller paid to show you,
+    #: not what the market is charging, and letting ads into a median biases it upward.
+    sponsored: bool = False
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -201,13 +209,19 @@ def summarize(listings: list[Listing]) -> dict:
     between them is visible — a wide one is itself the signal that the query needs
     narrowing.
     """
-    totals = sorted(x.price + (x.shipping or 0.0) for x in listings if x.price is not None)
+    # Sponsored rows are paid placement — what a seller paid to put in front of you, not what
+    # the market is charging. Amazon salts several into every results page, and letting them
+    # into a median biases it upward. Excluded, and counted so the exclusion is visible.
+    priced = [x for x in listings if x.price is not None]
+    ranked = [x for x in priced if not x.sponsored]
+    excluded = len(priced) - len(ranked)
+    totals = sorted(x.price + (x.shipping or 0.0) for x in ranked)
     if not totals:
-        return {"count": 0}
+        return {"count": 0, "sponsored_excluded": excluded} if excluded else {"count": 0}
     n = len(totals)
     mid = n // 2
     median = totals[mid] if n % 2 else (totals[mid - 1] + totals[mid]) / 2
-    return {
+    stats = {
         "count": n,
         "median": round(median, 2),
         "mean": round(sum(totals) / n, 2),
@@ -218,6 +232,9 @@ def summarize(listings: list[Listing]) -> dict:
         "p75": round(totals[min(n - 1, int(n * 0.75))], 2),
         "basis": "item price + shipping, where shipping was stated",
     }
+    if excluded:
+        stats["sponsored_excluded"] = excluded
+    return stats
 
 
 # ── the page script ─────────────────────────────────────────────────────────────────

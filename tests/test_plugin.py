@@ -91,7 +91,15 @@ class TestBrowserSession:
 
 
 class TestCliJson:
-    def test_unwraps_the_result_envelope(self):
+    def test_unwraps_the_real_cli_envelope(self):
+        """The CLI nests the payload under `data`, not at the top level. Unwrapping only a
+        top-level "result" handed callers the whole envelope — whose .get("found_container")
+        is None — so EVERY live search reported "couldn't find the results list" while the
+        page had loaded fine. Looked like rate limiting for a while; it was this."""
+        env = {"success": True, "data": {"origin": "https://x", "result": json.dumps({"count": 22})}, "error": None}
+        assert _parse_cli_json(json.dumps(env)) == {"count": 22}
+
+    def test_still_unwraps_a_bare_top_level_result(self):
         assert _parse_cli_json(json.dumps({"result": {"a": 1}})) == {"a": 1}
 
     def test_decodes_a_double_encoded_page_result(self):
@@ -319,3 +327,69 @@ class TestWaitsForResults:
         tools = {t.name: t for t in build_tools({})}
         assert json.loads(tools["ebay_price_check"].invoke({"query": "x"}))["ok"] is True
         assert b.waited and "s-card" in b.waited[0] and "s-item" in b.waited[0]
+
+
+class TestCompareAcrossMarketplaces:
+    def test_a_failing_source_is_named_not_dropped(self, monkeypatch):
+        """A missing source that simply vanishes turns a half-answer into a confident whole
+        one — "Amazon is cheaper" when Amazon never actually answered."""
+        import ebay_plugin.tools as tools_mod
+
+        b = _StubBrowser(_GOOD_PAGE)
+        monkeypatch.setattr(tools_mod, "Browser", lambda **kw: b)
+        monkeypatch.setattr(
+            tools_mod, "_fetch_amazon", lambda *a, **k: (_ for _ in ()).throw(tools_mod.EbayError("bot check"))
+        )
+        out = json.loads({t.name: t for t in build_tools({})}["compare_prices"].invoke({"query": "x"}))
+        assert out["sources"]["amazon_active"]["ok"] is False
+        assert "bot check" in out["sources"]["amazon_active"]["error"]
+        assert out["partial"] == "only 2 of 3 sources returned data"
+
+    def test_sold_and_asking_are_labelled_separately(self, monkeypatch):
+        """The whole point of the comparison: they are different measures and must never be
+        averaged into one 'market price'."""
+        import ebay_plugin.tools as tools_mod
+
+        b = _StubBrowser(_GOOD_PAGE)
+        monkeypatch.setattr(tools_mod, "Browser", lambda **kw: b)
+        monkeypatch.setattr(tools_mod, "_fetch_amazon", lambda *a, **k: ([], 0))
+        out = json.loads({t.name: t for t in build_tools({})}["compare_prices"].invoke({"query": "x"}))
+        assert "what buyers actually paid" in out["sources"]["ebay_sold"]["basis"]
+        assert "asking" in out["sources"]["ebay_active"]["basis"]
+        assert "asking" in out["sources"]["amazon_active"]["basis"]
+        assert "not combined" in out["note"]
+
+    def test_every_source_failing_is_an_overall_failure(self, monkeypatch):
+        import ebay_plugin.tools as tools_mod
+
+        monkeypatch.setattr(tools_mod, "Browser", lambda **kw: _StubBrowser(BrowserError("no browser")))
+        monkeypatch.setattr(
+            tools_mod, "_fetch_amazon", lambda *a, **k: (_ for _ in ()).throw(tools_mod.EbayError("no browser"))
+        )
+        out = json.loads({t.name: t for t in build_tools({})}["compare_prices"].invoke({"query": "x"}))
+        assert out["ok"] is False and "every source failed" in out["error"]
+
+
+class TestHistoryRecording:
+    def test_the_comparison_tool_also_records(self, monkeypatch, tmp_path):
+        """Only the single-source checks logged at first, so compare_prices — the tool most
+        likely to be run repeatedly on a watched item — built no history at all."""
+        import ebay_plugin.tools as tools_mod
+
+        monkeypatch.setattr(tools_mod, "Browser", lambda **kw: _StubBrowser(_GOOD_PAGE))
+        monkeypatch.setattr(tools_mod, "_fetch_amazon", lambda *a, **k: ([], 0))
+        db = tmp_path / "h.db"
+        tools = {t.name: t for t in build_tools({"history_db": str(db)})}
+        tools["compare_prices"].invoke({"query": "switch oled"})
+
+        from ebay_plugin.history import PriceHistory
+
+        assert PriceHistory(db).summary("switch oled")["observations"] > 0
+
+    def test_a_broken_history_store_never_fails_a_price_check(self, monkeypatch):
+        """History is a nice-to-have; a search must still answer without it."""
+        import ebay_plugin.tools as tools_mod
+
+        monkeypatch.setattr(tools_mod, "Browser", lambda **kw: _StubBrowser(_GOOD_PAGE))
+        tools = {t.name: t for t in build_tools({"history_db": "/nonexistent-dir/\x00/bad.db"})}
+        assert json.loads(tools["ebay_price_check"].invoke({"query": "x"}))["ok"] is True
