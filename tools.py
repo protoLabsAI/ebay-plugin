@@ -176,7 +176,57 @@ def _fetch(browser: Browser, url: str, *, sold: bool):
             f"matches'.{where} Run ebay_page_probe on the URL for the details."
         )
     listings, dropped = normalize(data.get("rows") or [], sold=sold)
-    return listings, dropped
+    return listings, dropped, _page_meta(data)
+
+
+def _page_meta(data: dict) -> dict:
+    """What the page said about itself beyond the rows: eBay's own match count, how many
+    padded "fewer words" rows were left out, and whether it rewrote the query."""
+    head = data.get("headline_count")
+    return {
+        "headline_count": int(head) if isinstance(head, (int, float)) else None,
+        "related_rows_excluded": int(data.get("related_rows_excluded") or 0),
+        "query_rewritten": bool(data.get("query_rewritten")),
+    }
+
+
+def _page_notes(meta: dict, found: int) -> list[str]:
+    """Plain-language qualifiers the model must repeat. A padded page used to come back as
+    "54 sold comps, median $31" for a query eBay itself matched to nothing."""
+    notes: list[str] = []
+    related = int(meta.get("related_rows_excluded") or 0)
+    head = meta.get("headline_count")
+    divider = "below eBay's 'Results matching fewer words' divider"
+    if found == 0 and (related or head == 0):
+        notes.append(
+            f"eBay found no listings matching all the words in this query (its own count: {head}); "
+            f"{related} loosely related listings {divider} were excluded. Broaden the query — do not "
+            "price from those."
+        )
+    elif related and found < 5:
+        notes.append(
+            f"only {found} listings matched the whole query; {related} loosely related listings {divider} "
+            "were excluded. A thin result — broaden the query before quoting a number."
+        )
+    elif related:
+        notes.append(f"{related} loosely related listings {divider} were excluded from the statistics.")
+    if meta.get("query_rewritten"):
+        notes.append(
+            "eBay rewrote this search ('Showing results for …'); every result is for ITS query, not "
+            "yours — check the page before trusting these numbers."
+        )
+    return notes
+
+
+def _with_meta(payload: dict, meta: dict, found: int) -> dict:
+    payload["headline_count"] = meta.get("headline_count")
+    payload["related_rows_excluded"] = meta.get("related_rows_excluded", 0)
+    if meta.get("query_rewritten"):
+        payload["query_rewritten"] = True
+    notes = _page_notes(meta, found)
+    if notes:
+        payload["notes"] = notes
+    return payload
 
 
 def _as_bool(value, default: bool) -> bool:
@@ -235,7 +285,7 @@ def build_tools(cfg: dict):
         b = _browser()
         try:
             url = search_url(query, domain=domain, sold=sold, condition=condition)
-            listings, dropped = _fetch(b, url, sold=sold)
+            listings, dropped, meta = _fetch(b, url, sold=sold)
         except (BrowserError, EbayError) as exc:
             return json.dumps({"ok": False, "error": str(exc)})
         except ValueError as exc:
@@ -246,21 +296,25 @@ def build_tools(cfg: dict):
         _record(query, "ebay", listings)
         stats = summarize(listings)
         return json.dumps(
-            {
-                "ok": True,
-                "query": query,
-                "basis": "sold listings — what buyers paid"
-                if sold
-                else "active listings — asking prices, NOT sale prices",
-                "condition": condition,
-                "url": url,
-                "stats": stats,
-                # Surfaced so the model can qualify a thin result instead of treating three
-                # comps with the same confidence as sixty.
-                "results_found": len(listings),
-                "unparseable_rows_skipped": dropped,
-                "sample": [x.as_dict() for x in listings[:_SAMPLE]],
-            }
+            _with_meta(
+                {
+                    "ok": True,
+                    "query": query,
+                    "basis": "sold listings — what buyers paid"
+                    if sold
+                    else "active listings — asking prices, NOT sale prices",
+                    "condition": condition,
+                    "url": url,
+                    "stats": stats,
+                    # Surfaced so the model can qualify a thin result instead of treating three
+                    # comps with the same confidence as sixty.
+                    "results_found": len(listings),
+                    "unparseable_rows_skipped": dropped,
+                    "sample": [x.as_dict() for x in listings[:_SAMPLE]],
+                },
+                meta,
+                len(listings),
+            )
         )
 
     @tool
@@ -276,19 +330,23 @@ def build_tools(cfg: dict):
         b = _browser()
         try:
             url = search_url(query, domain=domain, sold=sold, sort=sort, condition=condition)
-            listings, dropped = _fetch(b, url, sold=sold)
+            listings, dropped, meta = _fetch(b, url, sold=sold)
         except (BrowserError, EbayError, ValueError) as exc:
             return json.dumps({"ok": False, "error": str(exc)})
         return json.dumps(
-            {
-                "ok": True,
-                "query": query,
-                "sold": sold,
-                "url": url,
-                "count": len(listings),
-                "unparseable_rows_skipped": dropped,
-                "listings": [x.as_dict() for x in listings[:max_results]],
-            }
+            _with_meta(
+                {
+                    "ok": True,
+                    "query": query,
+                    "sold": sold,
+                    "url": url,
+                    "count": len(listings),
+                    "unparseable_rows_skipped": dropped,
+                    "listings": [x.as_dict() for x in listings[:max_results]],
+                },
+                meta,
+                len(listings),
+            )
         )
 
     @tool
@@ -461,7 +519,7 @@ def build_tools(cfg: dict):
         b = _browser()
         try:
             url = search_url(query, domain=domain, sold=True, condition=condition)
-            listings, dropped = _fetch(b, url, sold=True)
+            listings, dropped, meta = _fetch(b, url, sold=True)
         except (BrowserError, EbayError, ValueError) as exc:
             return json.dumps({"ok": False, "error": str(exc)})
 
@@ -469,7 +527,11 @@ def build_tools(cfg: dict):
         stats = summarize(listings)
         if not stats.get("count"):
             return json.dumps(
-                {"ok": True, "query": query, "stats": stats, "note": "no sold comps found — try a broader query"}
+                _with_meta(
+                    {"ok": True, "query": query, "stats": stats, "note": "no sold comps found — try a broader query"},
+                    meta,
+                    0,
+                )
             )
 
         schedule = schedule_from_config(fee_cfg)
@@ -487,22 +549,26 @@ def build_tools(cfg: dict):
             }
 
         return json.dumps(
-            {
-                "ok": True,
-                "query": query,
-                "basis": "sold listings — what buyers paid",
-                "url": url,
-                "stats": stats,
-                "results_found": len(listings),
-                "unparseable_rows_skipped": dropped,
-                "breakeven_price": breakeven_price(schedule=schedule, costs=costs),
-                "at_market_prices": scenarios,
-                "your_costs": costs.total,
-                "schedule": schedule.as_dict(),
-                "caveat": ""
-                if schedule.verified
-                else "Fee schedule is UNVERIFIED — confirm against a real eBay invoice.",
-            }
+            _with_meta(
+                {
+                    "ok": True,
+                    "query": query,
+                    "basis": "sold listings — what buyers paid",
+                    "url": url,
+                    "stats": stats,
+                    "results_found": len(listings),
+                    "unparseable_rows_skipped": dropped,
+                    "breakeven_price": breakeven_price(schedule=schedule, costs=costs),
+                    "at_market_prices": scenarios,
+                    "your_costs": costs.total,
+                    "schedule": schedule.as_dict(),
+                    "caveat": ""
+                    if schedule.verified
+                    else "Fee schedule is UNVERIFIED — confirm against a real eBay invoice.",
+                },
+                meta,
+                len(listings),
+            )
         )
 
     amazon_domain = cfg.get("amazon_domain") or "www.amazon.com"
@@ -625,19 +691,25 @@ def build_tools(cfg: dict):
 
         def _run(key, basis, fetch):
             try:
-                listings, dropped = fetch()
+                fetched = fetch()
+                listings, dropped = fetched[0], fetched[1]
+                meta = fetched[2] if len(fetched) > 2 else {}  # the Amazon reader has no padding meta
                 # Record here too. Only the single-source checks logged at first, so the
                 # comparison — the tool most likely to be run repeatedly on a watched item —
                 # built no history at all.
                 _record(query, "amazon" if key.startswith("amazon") else "ebay", listings)
-                out["sources"][key] = {
-                    "ok": True,
-                    "basis": basis,
-                    "stats": summarize(listings),
-                    "results_found": len(listings),
-                    "unparseable_rows_skipped": dropped,
-                    "sample": [x.as_dict() for x in listings[:3]],
-                }
+                out["sources"][key] = _with_meta(
+                    {
+                        "ok": True,
+                        "basis": basis,
+                        "stats": summarize(listings),
+                        "results_found": len(listings),
+                        "unparseable_rows_skipped": dropped,
+                        "sample": [x.as_dict() for x in listings[:3]],
+                    },
+                    meta,
+                    len(listings),
+                )
             except (BrowserError, EbayError, ValueError) as exc:
                 # Named, not omitted: a missing source that looks like an absent one turns a
                 # half-answer into a confident whole one.

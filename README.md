@@ -30,6 +30,7 @@ hand, once, in a browser window.
 | **Headed only** | eBay answers headless browsers with an error page. |
 | **Rate-limited** | Hit either site hard and you get verification pages. `min_interval_s` paces requests; raise it if that happens. |
 | **Markup isn't a contract** | Selectors were verified live and will eventually break. The tools distinguish "no results" from "couldn't read the page" and report the second as a bug. |
+| **Thin searches are padded** | A search with few exact matches gets a "Results matching fewer words" river of loosely related items. The tools count only the exact matches and report the rest as `related_rows_excluded`, with eBay's own `headline_count` alongside. |
 
 This plugin makes **no attempt to defeat bot detection** — no proxy rotation, no fingerprint
 spoofing, no CAPTCHA solving. It drives a normal browser at a human pace. When eBay asks for

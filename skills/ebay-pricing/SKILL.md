@@ -19,8 +19,9 @@ current asking prices" are different claims and must never be stated the same wa
 
 1. **Search the item as a buyer would type it.** Include the details that change the price
    — model number, capacity, edition, bundle — and nothing that doesn't.
-2. **Read `results_found` before the statistics.** Under ~10 comps is a weak signal; say so
-   rather than quoting a median to the cent off five data points.
+2. **Read `results_found`, `headline_count` and `notes` before the statistics.** Under ~10
+   comps is a weak signal; say so rather than quoting a median to the cent off five data
+   points. A non-empty `notes` list is part of the answer, not a footnote.
 3. **Sanity-check the spread.** If `high` is many times `low`, or `p25` and `p75` are far
    apart, the query is catching different things — a lot of 10 next to a single unit, or a
    different model. Narrow it and search again. A tight p25–p75 band is what makes a
@@ -38,6 +39,18 @@ current asking prices" are different claims and must never be stated the same wa
   $20 item shipped free, and comparing item prices alone gets that backwards.
 - `unparseable_rows_skipped` is rows with no readable price. A handful is normal. A large
   number next to a small `results_found` means treat the statistics as provisional.
+- **`headline_count` and `related_rows_excluded`.** eBay pads a search with few exact matches:
+  it shows the matches, then a divider reading "Results matching fewer words", then dozens of
+  loosely related items. Only the exact matches are counted in `results_found` and the
+  statistics; the padding is reported as `related_rows_excluded`. `headline_count` is eBay's
+  own count of exact matches. `results_found: 0` with `related_rows_excluded: 54` means eBay
+  found NOTHING for that query — broaden it; never price from the excluded rows.
+- **`query_rewritten: true`** means eBay silently searched for something else ("Showing results
+  for …"). Every number on that page is for its query, not yours. Say so and re-query.
+- **The same quartiles showing up for different items** (five items all at p25 $20.22) is the
+  signature of padding or a rewrite, not a market fact. Stop and look at the page.
+- Repeat every entry in `notes` when you report a number. They exist because a padded page once
+  came back as "54 sold comps, median $31" for a query eBay matched to nothing.
 
 ## When a tool returns an error
 

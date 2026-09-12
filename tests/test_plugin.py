@@ -532,3 +532,91 @@ class TestLaunchConfig:
         out = json.loads(by_name["ebay_session_status"].invoke({}))
         assert out["signed_in"] is True
         assert out["next_step"] == ""
+
+
+_PADDED_PAGE = {
+    "found_container": True,
+    "challenge": False,
+    "signin_wall": False,
+    "count": 0,
+    "headline_count": 0,
+    "related_rows_excluded": 54,
+    "query_rewritten": False,
+    "rows": [],
+}
+
+
+class TestPaddedResults:
+    """eBay pads a search with few exact matches: the matches, a 'Results matching fewer words'
+    divider, then dozens of loosely related items. Through 0.3.0 those were counted as comps —
+    a query eBay itself matched to NOTHING came back as '54 sold, median $31'."""
+
+    def test_a_zero_match_page_reports_no_comps_and_says_why(self, monkeypatch):
+        by_name, _ = _tools(monkeypatch, _PADDED_PAGE)
+        out = json.loads(by_name["ebay_price_check"].invoke({"query": "x"}))
+        assert out["ok"] is True
+        assert out["results_found"] == 0
+        assert out["stats"]["count"] == 0
+        assert out["headline_count"] == 0
+        assert out["related_rows_excluded"] == 54
+        assert any("54" in n and "fewer words" in n for n in out["notes"])
+        assert any("do not price from those" in n.lower() or "broaden" in n.lower() for n in out["notes"])
+
+    def test_price_and_profit_names_the_padding_when_there_are_no_comps(self, monkeypatch):
+        by_name, _ = _tools(monkeypatch, _PADDED_PAGE)
+        out = json.loads(by_name["ebay_price_and_profit"].invoke({"query": "x", "item_cost": 10}))
+        assert out["ok"] is True
+        assert out["stats"]["count"] == 0
+        assert out["related_rows_excluded"] == 54
+        assert any("fewer words" in n for n in out["notes"])
+
+    def test_a_thin_match_next_to_padding_is_flagged(self, monkeypatch):
+        page = {**_GOOD_PAGE, "headline_count": 2, "related_rows_excluded": 40}
+        by_name, _ = _tools(monkeypatch, page)
+        out = json.loads(by_name["ebay_price_check"].invoke({"query": "x"}))
+        assert out["results_found"] == 2
+        assert out["stats"]["count"] == 2  # statistics over the exact matches only
+        assert any("only 2" in n and "40" in n for n in out["notes"])
+
+    def test_a_healthy_page_with_some_padding_just_says_so(self, monkeypatch):
+        rows = [dict(_GOOD_PAGE["rows"][0], url=f"https://www.ebay.com/itm/{i}") for i in range(12)]
+        page = {**_GOOD_PAGE, "rows": rows, "count": 12, "headline_count": 12, "related_rows_excluded": 5}
+        by_name, _ = _tools(monkeypatch, page)
+        out = json.loads(by_name["ebay_price_check"].invoke({"query": "x"}))
+        assert out["results_found"] == 12
+        assert out["notes"] == [
+            "5 loosely related listings below eBay's 'Results matching fewer words' divider were excluded from the statistics."
+        ]
+
+    def test_a_clean_page_has_no_notes(self, monkeypatch):
+        by_name, _ = _tools(monkeypatch, _GOOD_PAGE)
+        out = json.loads(by_name["ebay_price_check"].invoke({"query": "x"}))
+        assert "notes" not in out
+        assert out["related_rows_excluded"] == 0
+        assert out["headline_count"] is None  # older payloads / unknown markup: not claimed
+
+    def test_a_rewritten_query_is_called_out(self, monkeypatch):
+        page = {**_GOOD_PAGE, "query_rewritten": True}
+        by_name, _ = _tools(monkeypatch, page)
+        out = json.loads(by_name["ebay_search"].invoke({"query": "x"}))
+        assert out["query_rewritten"] is True
+        assert any("rewrote" in n for n in out["notes"])
+
+    def test_compare_carries_the_notes_per_ebay_source(self, monkeypatch):
+        import ebay_plugin.tools as tools_mod
+
+        b = _StubBrowser(_PADDED_PAGE)
+        monkeypatch.setattr(tools_mod, "Browser", lambda **kw: b)
+        monkeypatch.setattr(tools_mod, "_fetch_amazon", lambda *a, **k: ([], 0))
+        out = json.loads({t.name: t for t in build_tools({})}["compare_prices"].invoke({"query": "x"}))
+        assert out["sources"]["ebay_sold"]["related_rows_excluded"] == 54
+        assert any("fewer words" in n for n in out["sources"]["ebay_sold"]["notes"])
+        assert "notes" not in out["sources"]["amazon_active"]  # the Amazon reader has no padding meta
+
+    def test_the_page_script_reports_the_new_fields(self):
+        """The JS itself can't run here; pin that it emits the keys the tools read."""
+        from ebay_plugin.extract import RESULT_JS
+
+        for key in ("headline_count", "related_rows_excluded", "query_rewritten"):
+            assert key in RESULT_JS
+        assert "Results matching fewer words" in RESULT_JS or "results matching fewer words" in RESULT_JS
