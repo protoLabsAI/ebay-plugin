@@ -9,8 +9,17 @@ per-command.** ``open --profile X`` on an already-running daemon prints
 ``⚠ --profile, --headed ignored: daemon already running`` and proceeds with whatever
 profile that daemon started under. Silently accepting that would mean browsing as the wrong
 identity — logged out, or worse, as some other account — so :meth:`Browser.ensure_session`
-surfaces it as a real error instead. The operator either closes the daemon or points this
-plugin at the profile already in use.
+surfaces it as a real error instead.
+
+The twist: the daemon that is "already running" is usually OURS. It outlives the agent
+process (a detached daemon, no idle timeout in the pinned CLI), so after an agent restart, or
+from a subagent that built its own tool set, the very first eBay call used to trip this guard
+on the session this plugin had launched an hour earlier — and the error told the operator to
+``close --all``, killing the signed-in session it was trying to protect. So a clean launch now
+leaves a small marker in the profile dir recording the options it launched with; a later
+instance that finds the daemon running compares its own options to that marker, adopts the
+session when they match, names the difference when they don't, and treats only a marker-less
+daemon as a stranger.
 """
 
 from __future__ import annotations
@@ -22,11 +31,19 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 log = logging.getLogger("protoagent.plugins.ebay")
 
 #: The CLI prints this when launch flags were dropped because a daemon was already up.
 _IGNORED_MARKER = "ignored: daemon already running"
+#: Chrome flag that clears ``navigator.webdriver``, which Chrome sets under CDP control and
+#: which Google's sign-in refuses ("this browser or app may not be secure"). The same flag
+#: protoAgent's core browser plugin uses for its ``stealth`` option — and nothing more.
+_STEALTH_ARGS = "--disable-blink-features=AutomationControlled"
+#: Left in the profile dir by a clean launch; read back by a later instance that finds the
+#: daemon already running, to tell "our own session" from "someone else's browser".
+_MARKER_NAME = ".protoagent-ebay-session.json"
 
 
 class BrowserError(RuntimeError):
@@ -55,8 +72,9 @@ class Browser:
     """Drives one named ``agent-browser`` session.
 
     ``min_interval_s`` paces navigations. This is politeness, not evasion — it keeps a
-    research loop from hammering a site faster than a person would. Nothing here tries to
-    look like something it isn't.
+    research loop from hammering a site faster than a person would. ``stealth`` drops the
+    one automation flag that blocks Google's sign-in page; the browser still identifies
+    itself as Chrome and nothing here tries to look like something it isn't.
     """
 
     def __init__(
@@ -66,6 +84,7 @@ class Browser:
         session: str = "ebay",
         profile: str = "",
         headed: bool = True,
+        stealth: bool = False,
         timeout_s: float = 60.0,
         min_interval_s: float = 1.5,
     ):
@@ -73,6 +92,7 @@ class Browser:
         self.session = session
         self.profile = profile
         self.headed = headed
+        self.stealth = stealth
         self.timeout_s = timeout_s
         self.min_interval_s = min_interval_s
         self._last_nav = 0.0
@@ -97,14 +117,54 @@ class Browser:
             time.sleep(self.min_interval_s - gap)
         self._last_nav = time.monotonic()
 
+    # ── launch bookkeeping ──────────────────────────────────────────────────────
+    def _launch_options(self) -> dict:
+        """The daemon-level options this instance wants; what the marker records and compares."""
+        return {
+            "session": self.session,
+            "profile": str(Path(self.profile).expanduser()) if self.profile else "",
+            "headed": self.headed,
+            "stealth": self.stealth,
+        }
+
+    def _marker_path(self) -> Path | None:
+        return Path(self.profile).expanduser() / _MARKER_NAME if self.profile else None
+
+    def _write_marker(self) -> None:
+        path = self._marker_path()
+        if path is None:
+            return
+        record = {**self._launch_options(), "launched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        try:
+            path.write_text(json.dumps(record))
+        except OSError as exc:  # the profile dir is Chrome's; not being able to leave a note there is not fatal
+            log.warning("[ebay] could not record the browser launch in %s: %s", path, exc)
+
+    def _read_marker(self) -> dict | None:
+        path = self._marker_path()
+        if path is None:
+            return None
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _clear_marker(self) -> None:
+        path = self._marker_path()
+        if path is not None:
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
+
     # ── session ─────────────────────────────────────────────────────────────────
     def ensure_session(self) -> None:
         """Launch the browser once, with our profile actually applied.
 
-        Raises if the CLI dropped the launch flags because another daemon already owns the
-        browser: the whole point of the profile is the logged-in eBay session, so quietly
-        continuing without it would produce confidently wrong answers from a logged-out or
-        unrelated identity.
+        Raises if the CLI dropped the launch flags because a daemon we can't account for
+        already owns the session: the whole point of the profile is the logged-in eBay
+        session, so quietly continuing without it would produce confidently wrong answers
+        from a logged-out or unrelated identity. A daemon this plugin launched itself, with
+        the same options, is adopted instead — see the module docstring.
         """
         if self._session_ready:
             return
@@ -115,21 +175,48 @@ class Browser:
             args += ["--profile", self.profile]
         if self.headed:
             args += ["--headed"]
+        if self.stealth:
+            args += ["--args", _STEALTH_ARGS]
         args += ["--session", self.session]
         res = _run(args, timeout=self.timeout_s)
         if not res.ok:
             raise BrowserError(f"could not start the browser: {(res.stderr or res.stdout).strip()}")
-        if self.profile and _IGNORED_MARKER in (res.stdout + res.stderr):
-            raise BrowserError(
-                "a browser daemon is already running, so this plugin's profile "
-                f"({self.profile}) was ignored — it would be browsing as whatever identity that "
-                "daemon started under, not your signed-in eBay session. Run `agent-browser close "
-                "--all` and retry, or set ebay.profile to the profile already in use."
-            )
+        if _IGNORED_MARKER in (res.stdout + res.stderr):
+            if self.profile:  # no profile → no signed-in identity at stake → a shared daemon is just a browser
+                self._adopt_running_session()
+        else:
+            self._write_marker()
         self._session_ready = True
+
+    def _adopt_running_session(self) -> None:
+        """The daemon dropped our launch flags because it was already up. Ours, or a stranger's?"""
+        close_hint = f"run `agent-browser close --session {self.session}` and retry"
+        marker = self._read_marker()
+        if marker is None:
+            raise BrowserError(
+                f"a browser daemon already owns the {self.session!r} session, so this plugin's profile "
+                f"({self.profile}) was ignored — it would be browsing as whatever identity that daemon "
+                f"started under, not your signed-in eBay session. Either {close_hint}, or set ebay.profile "
+                "to the profile already in use."
+            )
+        want = self._launch_options()
+        diffs = [
+            f"{k}: running with {marker.get(k)!r}, config wants {v!r}" for k, v in want.items() if marker.get(k) != v
+        ]
+        if diffs:
+            raise BrowserError(
+                f"the {self.session!r} browser session this plugin launched is still running with different "
+                f"options ({'; '.join(diffs)}). Launch options only apply when the browser starts, so {close_hint}."
+            )
+        log.info(
+            "[ebay] adopted the running %r browser session (launched with this profile at %s)",
+            self.session,
+            marker.get("launched_at", "?"),
+        )
 
     def close(self) -> None:
         _run(self._cmd("close"), timeout=self.timeout_s)
+        self._clear_marker()
         self._session_ready = False
 
     # ── actions ─────────────────────────────────────────────────────────────────

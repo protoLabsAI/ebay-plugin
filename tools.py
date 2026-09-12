@@ -192,6 +192,7 @@ def build_tools(cfg: dict):
         session=cfg.get("session") or "ebay",
         profile=cfg.get("profile") or "",
         headed=bool(cfg.get("headed", True)),
+        stealth=bool(cfg.get("stealth", False)),
         timeout_s=float(cfg.get("timeout_s", 60)),
         min_interval_s=float(cfg.get("min_interval_s", 1.5)),
     )
@@ -293,14 +294,22 @@ def build_tools(cfg: dict):
         except BrowserError as exc:
             return json.dumps({"ok": False, "error": str(exc)})
         signed_in = bool(isinstance(data, dict) and data.get("signed_in"))
+        next_step = ""
+        if not signed_in:
+            next_step = "Sign in to eBay in the browser window that just opened; the profile keeps you signed in."
+            if not getattr(b, "stealth", False):
+                # Chrome under CDP control carries navigator.webdriver, and Google's sign-in page
+                # refuses such a browser. That is a config fix, not something the operator can click past.
+                next_step += (
+                    " If Google refuses the sign-in as an insecure browser, set ebay.stealth: true, run "
+                    f"`agent-browser close --session {getattr(b, 'session', 'ebay')}`, and call this again."
+                )
         return json.dumps(
             {
                 "ok": True,
                 "signed_in": signed_in,
                 "greeting": (data or {}).get("greeting", ""),
-                "next_step": ""
-                if signed_in
-                else "Sign in to eBay in the browser window that just opened; the profile keeps you signed in.",
+                "next_step": next_step,
             }
         )
 

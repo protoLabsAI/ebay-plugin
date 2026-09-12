@@ -49,6 +49,7 @@ plugins:
 ebay:
   profile: ~/.protoagent/ebay-profile   # REQUIRED — this is what keeps you signed in
   headed: true
+  stealth: false                        # true if your eBay account signs in through Google (below)
   domain: www.ebay.com                  # www.ebay.co.uk, www.ebay.de, …
   amazon_domain: www.amazon.com
 ```
@@ -56,10 +57,23 @@ ebay:
 Then ask the agent to run `ebay_session_status`, and **sign in once** in the window that
 opens. The profile persists it.
 
-> `profile` and `headed` are **daemon-level** launch options in `agent-browser`. If a browser
-> daemon is already running under different options the CLI ignores them silently — so the
-> plugin raises instead of browsing as the wrong identity. `agent-browser close --all`, then
-> retry.
+### Signing in through Google
+
+Chrome sets `navigator.webdriver` when it is driven over CDP, and Google refuses to sign an
+account in from such a browser ("This browser or app may not be secure"). If your eBay account
+signs in through Google, set `stealth: true`: the browser launches with
+`--disable-blink-features=AutomationControlled` — the same flag protoAgent's core browser plugin
+uses for its stealth option — and nothing else changes. The browser still identifies as Chrome
+and runs at a human pace; this is not an attempt to defeat eBay's own checks. An eBay password
+or passkey login needs none of this.
+
+> `profile`, `headed` and `stealth` are **daemon-level** launch options in `agent-browser`: they
+> apply when the browser starts and are silently ignored afterwards. The plugin records the
+> options it launched with (a small JSON file in the profile dir), so a later agent process — or
+> a subagent with its own tool set — adopts its own running session instead of failing. A session
+> started by something else, or by this plugin with different options, is refused with the exact
+> difference named. The fix is always `agent-browser close --session ebay`, then retry — never
+> `close --all`, which also kills every other plugin's browser.
 
 ## Tools
 

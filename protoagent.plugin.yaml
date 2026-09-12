@@ -1,6 +1,6 @@
 id: ebay
 name: Marketplace prices (eBay + Amazon, via browser)
-version: 0.2.0
+version: 0.3.0
 description: >-
   Price research across eBay and Amazon — what an item actually SOLD for on eBay, what it
   is being asked on both, and where today's price sits against what we've recorded before.
@@ -34,6 +34,15 @@ config:
   profile: ""
   # eBay refuses headless browsers with an error page. Leave this on.
   headed: true
+  # Drop the `navigator.webdriver` automation flag Chrome sets under CDP control
+  # (`--disable-blink-features=AutomationControlled`, the same flag protoAgent's core browser
+  # plugin uses for its stealth option, and nothing more). Google refuses to sign an account
+  # in from a browser carrying that flag ("this browser or app may not be secure"), so an eBay
+  # account that signs in THROUGH GOOGLE needs this on for the one-time sign-in. It is not an
+  # attempt to defeat eBay's own checks: the browser still identifies as Chrome and runs at a
+  # human pace. Like profile/headed it applies when the browser STARTS — after changing it,
+  # `agent-browser close --session ebay` so the next call relaunches.
+  stealth: false
   # Marketplace domains — www.ebay.co.uk / www.amazon.co.uk … for a non-US market.
   domain: www.ebay.com
   amazon_domain: www.amazon.com
