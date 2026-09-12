@@ -179,6 +179,15 @@ def _fetch(browser: Browser, url: str, *, sold: bool):
     return listings, dropped
 
 
+def _as_bool(value, default: bool) -> bool:
+    """A YAML/console flag: real bools pass through; the strings "false"/"no"/"0" mean False."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "false", "no", "0", "off"}
+    return bool(value)
+
+
 def build_tools(cfg: dict):
     from langchain_core.tools import tool
 
@@ -191,8 +200,8 @@ def build_tools(cfg: dict):
         binary=cfg.get("binary") or "agent-browser",
         session=cfg.get("session") or "ebay",
         profile=cfg.get("profile") or "",
-        headed=bool(cfg.get("headed", True)),
-        stealth=bool(cfg.get("stealth", False)),
+        headed=_as_bool(cfg.get("headed"), True),
+        stealth=_as_bool(cfg.get("stealth"), False),
         timeout_s=float(cfg.get("timeout_s", 60)),
         min_interval_s=float(cfg.get("min_interval_s", 1.5)),
     )
@@ -297,12 +306,12 @@ def build_tools(cfg: dict):
         next_step = ""
         if not signed_in:
             next_step = "Sign in to eBay in the browser window that just opened; the profile keeps you signed in."
-            if not getattr(b, "stealth", False):
+            if not b.stealth:
                 # Chrome under CDP control carries navigator.webdriver, and Google's sign-in page
                 # refuses such a browser. That is a config fix, not something the operator can click past.
                 next_step += (
-                    " If Google refuses the sign-in as an insecure browser, set ebay.stealth: true, run "
-                    f"`agent-browser close --session {getattr(b, 'session', 'ebay')}`, and call this again."
+                    " If Google refuses the sign-in as an insecure browser, set ebay.stealth: true; "
+                    "the browser relaunches with it on the next call."
                 )
         return json.dumps(
             {

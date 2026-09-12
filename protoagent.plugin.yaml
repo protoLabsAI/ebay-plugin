@@ -28,9 +28,9 @@ config:
   session: ebay
   # Persistent browser-profile dir — this is what keeps you signed in to eBay between runs.
   # Blank means no profile, which means signing in every session and losing the sold view.
-  # NOTE: profile/headed are DAEMON-level launch options. If a browser daemon is already
-  # running under different options the CLI silently ignores these, so the plugin raises
-  # instead of browsing as the wrong identity. `agent-browser close --all` then retry.
+  # profile/headed/stealth are DAEMON-level launch options; the plugin sends them with every
+  # page open and the daemon reconciles: unchanged → reused, changed → the browser relaunches
+  # with the new ones (same profile, so the sign-in survives), gone → respawned with them.
   profile: ""
   # eBay refuses headless browsers with an error page. Leave this on.
   headed: true
@@ -40,8 +40,8 @@ config:
   # in from a browser carrying that flag ("this browser or app may not be secure"), so an eBay
   # account that signs in THROUGH GOOGLE needs this on for the one-time sign-in. It is not an
   # attempt to defeat eBay's own checks: the browser still identifies as Chrome and runs at a
-  # human pace. Like profile/headed it applies when the browser STARTS — after changing it,
-  # `agent-browser close --session ebay` so the next call relaunches.
+  # human pace. Takes effect on the next page open after the config reload — the browser
+  # relaunches itself with it.
   stealth: false
   # Marketplace domains — www.ebay.co.uk / www.amazon.co.uk … for a non-US market.
   domain: www.ebay.com

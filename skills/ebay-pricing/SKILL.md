@@ -48,11 +48,8 @@ market claim.
 - **sign-in wall** → run `ebay_session_status`, tell the operator to sign in once in the
   browser window. It persists after that. If the operator reports Google refusing the sign-in
   as an insecure browser, that is config, not something to click past: `ebay.stealth: true`,
-  then `agent-browser close --session ebay`, then `ebay_session_status` again.
-- **browser session already running with different options** → the error names the option
-  that differs. The operator closes that one session (`agent-browser close --session ebay`,
-  never `--all`) and you retry. The plugin adopts its own running session when the options
-  match, so this only shows up after a config change.
+  then `ebay_session_status` again once the config has reloaded — the browser relaunches
+  with it.
 - **challenge page** → eBay wants a human interaction; ask the operator to complete it. If
   it recurs, suggest raising `ebay.min_interval_s`.
 - **couldn't find the results list** → eBay changed its markup. Run `ebay_page_probe` on the

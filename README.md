@@ -67,13 +67,16 @@ uses for its stealth option — and nothing else changes. The browser still iden
 and runs at a human pace; this is not an attempt to defeat eBay's own checks. An eBay password
 or passkey login needs none of this.
 
-> `profile`, `headed` and `stealth` are **daemon-level** launch options in `agent-browser`: they
-> apply when the browser starts and are silently ignored afterwards. The plugin records the
-> options it launched with (a small JSON file in the profile dir), so a later agent process — or
-> a subagent with its own tool set — adopts its own running session instead of failing. A session
-> started by something else, or by this plugin with different options, is refused with the exact
-> difference named. The fix is always `agent-browser close --session ebay`, then retry — never
-> `close --all`, which also kills every other plugin's browser.
+> `profile`, `headed` and `stealth` are **daemon-level** launch options in `agent-browser`. The
+> plugin sends them with every page open and the daemon reconciles them against the running
+> browser: unchanged → reused; changed → Chrome relaunches with the new options on the same
+> profile (a sign-in survives); daemon gone → one is respawned with them. So a fresh agent
+> process, a subagent with its own tool set, or a config change all converge on the right
+> browser with nothing to close by hand. (Through 0.2.0 the launch step was a URL-less `open`,
+> which the CLI turns into a second, option-less launch — every window it opened was replaced
+> within seconds by one on a throwaway profile. Fixed in 0.3.0.) If you ever do need to reset
+> the browser: `agent-browser close --session ebay`, never `close --all`, which also kills
+> every other plugin's browser.
 
 ## Tools
 

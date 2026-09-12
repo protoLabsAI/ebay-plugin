@@ -62,14 +62,11 @@ _IGNORED = (
     "⚠ --profile, --headed ignored: daemon already running. "
     "Use 'agent-browser close' first to restart with new options.\n"
 )
+_STEALTH = "--disable-blink-features=AutomationControlled"
 
 
 def _cli(monkeypatch, *, stdout="✓ Done\n", stderr="", ok=True):
-    """Stub the CLI seam; returns the argv list of every call the wrapper made.
-
-    The real CLI prints the 'ignored' warning on STDERR with a ZERO exit code, so the
-    fixture puts it there too — a guard that only read stdout would pass here and miss it live.
-    """
+    """Stub the CLI seam; returns the argv list of every call the wrapper made."""
     monkeypatch.setattr(browser_mod.shutil, "which", lambda b: "/usr/bin/agent-browser")
     calls = []
 
@@ -81,93 +78,104 @@ def _cli(monkeypatch, *, stdout="✓ Done\n", stderr="", ok=True):
     return calls
 
 
+def _opens(calls):
+    return [c for c in calls if len(c) > 2 and c[1] == "open"]
+
+
 class TestBrowserSession:
-    def test_a_foreign_daemon_is_an_error_not_a_silent_wrong_identity(self, monkeypatch, tmp_path):
-        """The CLI drops --profile when a daemon is already running and just warns. With no
-        record of this plugin having launched it, accepting that would mean browsing as
-        whatever identity that daemon has — logged out, or someone else's account."""
-        _cli(monkeypatch, stderr=_IGNORED)
-        with pytest.raises(BrowserError, match="already owns") as exc:
-            Browser(profile=str(tmp_path)).ensure_session()
-        assert "close --session ebay" in str(exc.value)
-        assert "--all" not in str(exc.value)  # that would kill every other plugin's browser too
+    def test_the_launch_is_an_open_with_a_url_never_a_bare_open(self, monkeypatch, tmp_path):
+        """A URL-less `open` with flags makes the CLI send a SECOND, option-less launch and the
+        daemon relaunches Chrome on a throwaway profile — the 0.2.0 bug that kept the profile
+        from ever holding a cookie. `open about:blank` sends exactly one full-options launch."""
+        calls = _cli(monkeypatch)
+        Browser(profile=str(tmp_path)).ensure_session()
+        (launch,) = _opens(calls)
+        assert launch[2] == "about:blank"
+        assert all(c[1] != "open" or c[2].startswith(("about:", "http")) for c in calls)
 
-    def test_our_own_running_session_is_adopted_not_rejected(self, monkeypatch, tmp_path):
-        """The daemon outlives the agent process. After a restart, or in a subagent that built
-        its own tools, the FIRST call used to trip the guard on the session this plugin had
-        launched itself — and told the operator to close it. The launch marker settles it."""
-        first = _cli(monkeypatch)
-        Browser(profile=str(tmp_path), headed=True).ensure_session()
-        assert len(first) == 1
-        assert (tmp_path / browser_mod._MARKER_NAME).exists()
-
-        later = _cli(monkeypatch, stderr=_IGNORED)  # a fresh process: the daemon is already up
-        b = Browser(profile=str(tmp_path), headed=True)
-        b.ensure_session()  # must not raise
-        assert b._session_ready
-        assert len(later) == 1
-
-    def test_a_running_session_with_different_options_names_the_difference(self, monkeypatch, tmp_path):
-        """Launch options only apply at start. Turning stealth on in config while the old
-        session still runs would silently change nothing — say exactly what differs instead."""
-        _cli(monkeypatch)
-        Browser(profile=str(tmp_path), stealth=False).ensure_session()
-        _cli(monkeypatch, stderr=_IGNORED)
-        with pytest.raises(BrowserError, match="stealth") as exc:
-            Browser(profile=str(tmp_path), stealth=True).ensure_session()
-        assert "close --session ebay" in str(exc.value)
-
-    def test_a_garbled_marker_counts_as_no_marker(self, monkeypatch, tmp_path):
-        (tmp_path / browser_mod._MARKER_NAME).write_text("not json")
-        _cli(monkeypatch, stderr=_IGNORED)
-        with pytest.raises(BrowserError, match="already owns"):
-            Browser(profile=str(tmp_path)).ensure_session()
-
-    def test_close_forgets_the_launch_marker(self, monkeypatch, tmp_path):
-        _cli(monkeypatch)
-        b = Browser(profile=str(tmp_path))
-        b.ensure_session()
-        assert (tmp_path / browser_mod._MARKER_NAME).exists()
-        b.close()
-        assert not (tmp_path / browser_mod._MARKER_NAME).exists()
-        assert not b._session_ready
-
-    def test_no_profile_means_no_identity_to_protect(self, monkeypatch):
-        """Without a profile there is no signed-in identity at stake, so a shared daemon is
-        just a browser; the tools proceed as they always did."""
-        _cli(monkeypatch, stderr=_IGNORED)
-        b = Browser(profile="")
-        b.ensure_session()
-        assert b._session_ready
+    def test_launch_flags_ride_on_every_navigation(self, monkeypatch, tmp_path):
+        """The daemon reconciles the flags against the running browser on each open: same →
+        reused, changed → relaunch with the new ones, daemon gone → respawn with them. That is
+        what lets a fresh process, a subagent, or a config change converge with no bookkeeping,
+        and what stops a dead daemon from coming back with NO profile."""
+        calls = _cli(monkeypatch)
+        b = Browser(profile=str(tmp_path), headed=True, stealth=True, min_interval_s=0)
+        b.open("https://www.ebay.com/")
+        b.open("https://www.ebay.com/sch/i.html?_nkw=x")
+        opens = _opens(calls)
+        assert [c[2] for c in opens] == [
+            "about:blank",
+            "https://www.ebay.com/",
+            "https://www.ebay.com/sch/i.html?_nkw=x",
+        ]
+        for c in opens:
+            assert c[c.index("--profile") + 1] == str(tmp_path)
+            assert "--headed" in c
+            assert c[c.index("--args") + 1] == _STEALTH
+            assert c[-2:] == ["--session", "ebay"]  # scoped to our own session, never the default one
 
     def test_stealth_adds_the_automation_flag_only_when_asked(self, monkeypatch, tmp_path):
         calls = _cli(monkeypatch)
         Browser(profile=str(tmp_path)).ensure_session()
-        assert "--args" not in calls[0]
+        assert "--args" not in _opens(calls)[0]
         calls = _cli(monkeypatch)
         Browser(profile=str(tmp_path), stealth=True).ensure_session()
-        i = calls[0].index("--args")
-        assert calls[0][i + 1] == "--disable-blink-features=AutomationControlled"
-        assert calls[0][-2:] == ["--session", "ebay"]  # still scoped to our own session
+        launch = _opens(calls)[0]
+        assert launch[launch.index("--args") + 1] == _STEALTH
+
+    def test_no_profile_sends_no_profile_flag(self, monkeypatch):
+        calls = _cli(monkeypatch)
+        Browser(profile="", headed=False).ensure_session()
+        launch = _opens(calls)[0]
+        assert "--profile" not in launch
+        assert "--headed" not in launch
+
+    def test_the_ignored_warning_is_noise_not_an_error(self, monkeypatch, tmp_path):
+        """The CLI prints `⚠ … ignored: daemon already running` on stderr with exit 0 whenever
+        a daemon exists and flags were given — client-side, before the daemon has applied
+        them. 0.2.0 raised on it and told the operator to `close --all`; now it is ignored."""
+        _cli(monkeypatch, stderr=_IGNORED)
+        b = Browser(profile=str(tmp_path))
+        b.ensure_session()
+        assert b._session_ready
+
+    def test_a_failed_launch_is_an_error_with_the_cli_message(self, monkeypatch, tmp_path):
+        _cli(monkeypatch, ok=False, stderr="Failed to launch Chrome: boom")
+        with pytest.raises(BrowserError, match="could not start the browser: Failed to launch Chrome: boom"):
+            Browser(profile=str(tmp_path)).ensure_session()
 
     def test_a_missing_cli_says_how_to_install_it(self, monkeypatch):
         monkeypatch.setattr(browser_mod.shutil, "which", lambda b: None)
         with pytest.raises(BrowserError, match="npm i -g agent-browser"):
             Browser().ensure_session()
 
-    def test_clean_launch_marks_the_session_ready_once(self, monkeypatch, tmp_path):
+    def test_the_launch_happens_once_per_instance(self, monkeypatch, tmp_path):
         calls = _cli(monkeypatch)
         b = Browser(profile=str(tmp_path))
         b.ensure_session()
         b.ensure_session()
-        assert len(calls) == 1  # not relaunched on every call
+        assert len(_opens(calls)) == 1
 
-    def test_an_unwritable_profile_dir_does_not_fail_the_launch(self, monkeypatch, tmp_path):
-        """Chrome owns that directory; failing to leave our note in it must not break browsing."""
+    def test_close_is_scoped_to_our_session(self, monkeypatch, tmp_path):
+        calls = _cli(monkeypatch)
+        b = Browser(profile=str(tmp_path))
+        b.ensure_session()
+        b.close()
+        assert calls[-1] == ["/usr/bin/agent-browser", "close", "--session", "ebay"] or calls[-1][1:] == [
+            "close",
+            "--session",
+            "ebay",
+        ]
+        assert not b._session_ready
+
+    def test_nothing_is_written_into_the_profile_dir(self, monkeypatch, tmp_path):
+        """The profile dir is Chrome's. 0.3.0 briefly grew a launch-marker file there; the
+        daemon's own option reconciliation made it unnecessary, so it must stay gone."""
         _cli(monkeypatch)
-        b = Browser(profile=str(tmp_path / "not-created-yet"))
-        b.ensure_session()  # the marker write fails with OSError; the launch still counts
-        assert b._session_ready
+        b = Browser(profile=str(tmp_path), min_interval_s=0)
+        b.open("https://www.ebay.com/")
+        b.close()
+        assert list(tmp_path.iterdir()) == []
 
 
 class TestCliJson:
@@ -202,6 +210,8 @@ class _StubBrowser:
     def __init__(self, payload):
         self.payload = payload
         self.opened = []
+        self.session = "ebay"
+        self.stealth = False
 
     def open(self, url):
         self.opened.append(url)
@@ -487,6 +497,19 @@ class TestLaunchConfig:
         build_tools({})
         assert seen["stealth"] is False  # ships off, like core's browser plugin
 
+    def test_string_flags_from_a_settings_form_are_read_as_booleans(self, monkeypatch):
+        """`bool("false")` is True. A console field or a hand-edited YAML can hand us strings."""
+        import ebay_plugin.tools as tools_mod
+
+        seen = {}
+        monkeypatch.setattr(tools_mod, "Browser", lambda **kw: seen.update(kw) or _StubBrowser(_GOOD_PAGE))
+        build_tools({"stealth": "false", "headed": "false"})
+        assert seen["stealth"] is False
+        assert seen["headed"] is False
+        build_tools({"stealth": "true", "headed": "yes"})
+        assert seen["stealth"] is True
+        assert seen["headed"] is True
+
     def test_the_manifest_ships_stealth_off(self):
         manifest = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
         assert manifest["config"]["stealth"] is False
@@ -496,8 +519,7 @@ class TestLaunchConfig:
         out = json.loads(by_name["ebay_session_status"].invoke({}))
         assert out["signed_in"] is False
         assert "ebay.stealth: true" in out["next_step"]
-        assert "close --session" in out["next_step"]
-        assert "--all" not in out["next_step"]
+        assert "close" not in out["next_step"]  # nothing to close by hand any more
 
     def test_session_status_drops_the_stealth_hint_once_it_is_on(self, monkeypatch):
         by_name, stub = _tools(monkeypatch, {"signed_in": False, "greeting": ""})
