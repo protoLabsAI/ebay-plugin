@@ -184,7 +184,10 @@ def _as_bool(value, default: bool) -> bool:
     if value is None:
         return default
     if isinstance(value, str):
-        return value.strip().lower() not in {"", "false", "no", "0", "off"}
+        text = value.strip().lower()
+        if not text:  # a blank form field is "unset", not "off" — blank `headed` must not mean headless
+            return default
+        return text not in {"false", "no", "0", "off"}
     return bool(value)
 
 
@@ -311,7 +314,7 @@ def build_tools(cfg: dict):
                 # refuses such a browser. That is a config fix, not something the operator can click past.
                 next_step += (
                     " If Google refuses the sign-in as an insecure browser, set ebay.stealth: true; "
-                    "the browser relaunches with it on the next call."
+                    "once the config has reloaded, the browser relaunches with it on the next call."
                 )
         return json.dumps(
             {

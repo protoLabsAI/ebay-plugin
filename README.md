@@ -76,7 +76,8 @@ or passkey login needs none of this.
 > which the CLI turns into a second, option-less launch — every window it opened was replaced
 > within seconds by one on a throwaway profile. Fixed in 0.3.0.) If you ever do need to reset
 > the browser: `agent-browser close --session ebay`, never `close --all`, which also kills
-> every other plugin's browser.
+> every other plugin's browser. Two instances that need *different* profiles need different
+> `session` names too — one session reconciles to whichever instance opened it last.
 
 ## Tools
 

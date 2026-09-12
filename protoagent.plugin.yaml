@@ -25,6 +25,8 @@ config:
   # The agent-browser CLI on PATH (override for a pinned path).
   binary: agent-browser
   # Named browser session, so eBay work doesn't fight another plugin over the default one.
+  # Two instances that need DIFFERENT profiles need different session names too — a session
+  # reconciles to whichever instance opened it last.
   session: ebay
   # Persistent browser-profile dir — this is what keeps you signed in to eBay between runs.
   # Blank means no profile, which means signing in every session and losing the sold view.

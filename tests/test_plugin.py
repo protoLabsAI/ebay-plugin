@@ -161,11 +161,7 @@ class TestBrowserSession:
         b = Browser(profile=str(tmp_path))
         b.ensure_session()
         b.close()
-        assert calls[-1] == ["/usr/bin/agent-browser", "close", "--session", "ebay"] or calls[-1][1:] == [
-            "close",
-            "--session",
-            "ebay",
-        ]
+        assert calls[-1][1:] == ["close", "--session", "ebay"]
         assert not b._session_ready
 
     def test_nothing_is_written_into_the_profile_dir(self, monkeypatch, tmp_path):
@@ -509,6 +505,9 @@ class TestLaunchConfig:
         build_tools({"stealth": "true", "headed": "yes"})
         assert seen["stealth"] is True
         assert seen["headed"] is True
+        build_tools({"stealth": "", "headed": ""})  # blank form fields are "unset", never "off"
+        assert seen["stealth"] is False
+        assert seen["headed"] is True  # blank headed must not mean headless — eBay refuses headless
 
     def test_the_manifest_ships_stealth_off(self):
         manifest = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
