@@ -263,12 +263,38 @@ RESULT_JS = r"""
   for (const sel of CARD) { const f = document.querySelectorAll(sel); if (f.length) { cards = [...f]; break; } }
   const container = document.querySelector("ul.srp-results, .srp-river-results, .srp-results__list, [data-testid='search-results']");
 
+  // A search with few (or no) exact matches is PADDED: eBay renders the exact matches, then
+  // a divider reading "Results matching fewer words", then dozens of loosely related items
+  // (other teams' dice, complete boxes, $1 transfer sheets). Verified live 2026-09-12 on a
+  // query whose headline said "0 results": 2 filler cards, the divider, then 54 cards —
+  // which this script used to report as 54 sold comps with a median. Everything below the
+  // divider is excluded from `rows` and counted in `related_rows_excluded` instead.
+  const leafText = (el) => (el.children.length === 0 ? (el.textContent || "").trim() : "");
+  const divider = [...document.querySelectorAll("li, div, h2, h3, h4, span, p")].find((el) =>
+    /^results matching fewer words$|^results? for similar (searches|items)$/i.test(leafText(el))
+  ) || null;
+  const afterDivider = (c) => !!divider && !!(divider.compareDocumentPosition(c) & Node.DOCUMENT_POSITION_FOLLOWING);
+  // eBay's own count of exact matches ("1,234 results for …", or "0 results for …" on a
+  // padded page). Read so the caller can tell "few comps" from "none, and the rest is filler".
+  const headText = pick(document, [".srp-controls__count-heading", "h1.srp-controls__count-heading",
+                                   ".srp-controls__count", "[data-testid='count-heading']"]) ||
+                   (document.body ? document.body.innerText.slice(0, 3000) : "");
+  const headMatch = headText.match(/([\d,]+)\+?\s*results?\b/i);
+  const headline_count = headMatch ? parseInt(headMatch[1].replace(/,/g, ""), 10) : null;
+  // "Showing results for X — Search instead for Y": eBay rewrote the query, so EVERY card is
+  // for its query, not the caller's.
+  const controlsText = pick(document, [".srp-controls", ".srp-rewrite", ".srp-save-null-search"]) ||
+                       (document.body ? document.body.innerText.slice(0, 3000) : "");
+  const query_rewritten = /search instead for|showing results for/i.test(controlsText);
+
   const MONEYISH = /[$£€¥]\s*[\d.,]+/;
   const SHIPPING = /(delivery|shipping|postage|freight)/i;
   const rows = [];
+  let related_rows_excluded = 0;
   for (const c of cards) {
     const title = pick(c, [".s-item__title", ".s-card__title", "[role='heading']", "h3"]);
     if (!title || /^shop on ebay$/i.test(title)) continue;  // eBay's own filler card
+    if (afterDivider(c)) { related_rows_excluded += 1; continue; }
     const a = c.querySelector("a.s-item__link, a.s-card__link, a[href*='/itm/']");
 
     let price = pick(c, [".s-item__price", ".s-card__price"]);
@@ -313,6 +339,9 @@ RESULT_JS = r"""
     ),
     signin_wall: /signin\.ebay/.test(location.href + " " + (document.referrer || "")),
     count: rows.length,
+    headline_count,
+    related_rows_excluded,
+    query_rewritten,
     rows,
   });
 })()
