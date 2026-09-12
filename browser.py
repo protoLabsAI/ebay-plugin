@@ -4,13 +4,23 @@ Why shell out rather than depend on the ``agent_browser`` plugin: plugins must n
 each other (the event bus is the only inter-plugin channel), and this keeps the test suite
 host-free — every call goes through :func:`_run`, which tests replace wholesale.
 
-The one non-obvious thing about the CLI: **launch options are daemon-level, not
-per-command.** ``open --profile X`` on an already-running daemon prints
-``⚠ --profile, --headed ignored: daemon already running`` and proceeds with whatever
-profile that daemon started under. Silently accepting that would mean browsing as the wrong
-identity — logged out, or worse, as some other account — so :meth:`Browser.ensure_session`
-surfaces it as a real error instead. The operator either closes the daemon or points this
-plugin at the profile already in use.
+**Launch options are daemon-level, and how they are sent matters.** ``--profile``,
+``--headed`` and ``--args`` describe the Chrome the daemon runs. Given on an ``open <url>``,
+the CLI sends one full-options *launch* ahead of the navigation and the daemon reconciles it
+against the running browser: same options → reused; different → Chrome is relaunched with the
+new ones (on the same profile, so a sign-in survives); no daemon → one is started with them.
+So this wrapper rides the flags on EVERY ``open <url>``. A fresh agent process, a subagent's
+own tool set, a config change, a daemon that died — all converge on a browser with our
+options and no bookkeeping.
+
+What it must never do is a URL-less ``open`` with flags. That parses to an explicit launch
+carrying only ``headless``, sent right after the full-options one, and the daemon dutifully
+relaunches Chrome a second time — on a throwaway temp profile. That was this plugin's launch
+step through 0.2.0: every "signed-in" window it ever opened was abandoned within seconds for
+one on a profile nobody was signed in to, which is why the profile dir never held a cookie.
+(The CLI's ``⚠ … ignored: daemon already running`` warning is printed client-side whenever a
+daemon exists and flags were given; it is noise, not a signal — the daemon applied them.)
+Verified live against agent-browser 0.27.1 by watching Chrome's ``--user-data-dir``.
 """
 
 from __future__ import annotations
@@ -25,8 +35,10 @@ from dataclasses import dataclass
 
 log = logging.getLogger("protoagent.plugins.ebay")
 
-#: The CLI prints this when launch flags were dropped because a daemon was already up.
-_IGNORED_MARKER = "ignored: daemon already running"
+#: Chrome flag that clears ``navigator.webdriver``, which Chrome sets under CDP control and
+#: which Google's sign-in refuses ("this browser or app may not be secure"). The same flag
+#: protoAgent's core browser plugin uses for its ``stealth`` option — and nothing more.
+_STEALTH_ARGS = "--disable-blink-features=AutomationControlled"
 
 
 class BrowserError(RuntimeError):
@@ -55,8 +67,9 @@ class Browser:
     """Drives one named ``agent-browser`` session.
 
     ``min_interval_s`` paces navigations. This is politeness, not evasion — it keeps a
-    research loop from hammering a site faster than a person would. Nothing here tries to
-    look like something it isn't.
+    research loop from hammering a site faster than a person would. ``stealth`` drops the
+    one automation flag that blocks Google's sign-in page; the browser still identifies
+    itself as Chrome and nothing here tries to look like something it isn't.
     """
 
     def __init__(
@@ -66,6 +79,7 @@ class Browser:
         session: str = "ebay",
         profile: str = "",
         headed: bool = True,
+        stealth: bool = False,
         timeout_s: float = 60.0,
         min_interval_s: float = 1.5,
     ):
@@ -73,6 +87,7 @@ class Browser:
         self.session = session
         self.profile = profile
         self.headed = headed
+        self.stealth = stealth
         self.timeout_s = timeout_s
         self.min_interval_s = min_interval_s
         self._last_nav = 0.0
@@ -97,35 +112,34 @@ class Browser:
             time.sleep(self.min_interval_s - gap)
         self._last_nav = time.monotonic()
 
+    def _launch_flags(self) -> list[str]:
+        """The daemon-level options, sent with every ``open <url>`` (module docstring)."""
+        flags: list[str] = []
+        if self.profile:
+            flags += ["--profile", self.profile]
+        if self.headed:
+            flags += ["--headed"]
+        if self.stealth:
+            flags += ["--args", _STEALTH_ARGS]
+        return flags
+
+    def _open_cmd(self, url: str) -> list[str]:
+        return [self.binary, "open", url, *self._launch_flags(), "--session", self.session]
+
     # ── session ─────────────────────────────────────────────────────────────────
     def ensure_session(self) -> None:
-        """Launch the browser once, with our profile actually applied.
+        """Bring the browser up with our options, once per instance.
 
-        Raises if the CLI dropped the launch flags because another daemon already owns the
-        browser: the whole point of the profile is the logged-in eBay session, so quietly
-        continuing without it would produce confidently wrong answers from a logged-out or
-        unrelated identity.
+        ``open about:blank`` with the flags: the daemon starts, reuses, or relaunches as
+        needed (module docstring). Never a URL-less ``open`` — that is the double launch.
         """
         if self._session_ready:
             return
         if reason := self.available():
             raise BrowserError(reason)
-        args = [self.binary, "open"]
-        if self.profile:
-            args += ["--profile", self.profile]
-        if self.headed:
-            args += ["--headed"]
-        args += ["--session", self.session]
-        res = _run(args, timeout=self.timeout_s)
+        res = _run(self._open_cmd("about:blank"), timeout=self.timeout_s)
         if not res.ok:
             raise BrowserError(f"could not start the browser: {(res.stderr or res.stdout).strip()}")
-        if self.profile and _IGNORED_MARKER in (res.stdout + res.stderr):
-            raise BrowserError(
-                "a browser daemon is already running, so this plugin's profile "
-                f"({self.profile}) was ignored — it would be browsing as whatever identity that "
-                "daemon started under, not your signed-in eBay session. Run `agent-browser close "
-                "--all` and retry, or set ebay.profile to the profile already in use."
-            )
         self._session_ready = True
 
     def close(self) -> None:
@@ -136,7 +150,9 @@ class Browser:
     def open(self, url: str) -> None:
         self.ensure_session()
         self._pace()
-        res = _run(self._cmd("open", url), timeout=self.timeout_s)
+        # Flags on every navigation: a daemon that died (an operator's `close`, a newer
+        # CLI's idle timeout) respawns with our profile instead of a blank one.
+        res = _run(self._open_cmd(url), timeout=self.timeout_s)
         if not res.ok:
             raise BrowserError(f"could not open {url}: {(res.stderr or res.stdout).strip()}")
 

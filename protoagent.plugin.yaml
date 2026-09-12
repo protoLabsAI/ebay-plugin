@@ -1,6 +1,6 @@
 id: ebay
 name: Marketplace prices (eBay + Amazon, via browser)
-version: 0.2.0
+version: 0.3.0
 description: >-
   Price research across eBay and Amazon — what an item actually SOLD for on eBay, what it
   is being asked on both, and where today's price sits against what we've recorded before.
@@ -25,15 +25,26 @@ config:
   # The agent-browser CLI on PATH (override for a pinned path).
   binary: agent-browser
   # Named browser session, so eBay work doesn't fight another plugin over the default one.
+  # Two instances that need DIFFERENT profiles need different session names too — a session
+  # reconciles to whichever instance opened it last.
   session: ebay
   # Persistent browser-profile dir — this is what keeps you signed in to eBay between runs.
   # Blank means no profile, which means signing in every session and losing the sold view.
-  # NOTE: profile/headed are DAEMON-level launch options. If a browser daemon is already
-  # running under different options the CLI silently ignores these, so the plugin raises
-  # instead of browsing as the wrong identity. `agent-browser close --all` then retry.
+  # profile/headed/stealth are DAEMON-level launch options; the plugin sends them with every
+  # page open and the daemon reconciles: unchanged → reused, changed → the browser relaunches
+  # with the new ones (same profile, so the sign-in survives), gone → respawned with them.
   profile: ""
   # eBay refuses headless browsers with an error page. Leave this on.
   headed: true
+  # Drop the `navigator.webdriver` automation flag Chrome sets under CDP control
+  # (`--disable-blink-features=AutomationControlled`, the same flag protoAgent's core browser
+  # plugin uses for its stealth option, and nothing more). Google refuses to sign an account
+  # in from a browser carrying that flag ("this browser or app may not be secure"), so an eBay
+  # account that signs in THROUGH GOOGLE needs this on for the one-time sign-in. It is not an
+  # attempt to defeat eBay's own checks: the browser still identifies as Chrome and runs at a
+  # human pace. Takes effect on the next page open after the config reload — the browser
+  # relaunches itself with it.
+  stealth: false
   # Marketplace domains — www.ebay.co.uk / www.amazon.co.uk … for a non-US market.
   domain: www.ebay.com
   amazon_domain: www.amazon.com

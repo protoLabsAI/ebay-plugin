@@ -49,6 +49,7 @@ plugins:
 ebay:
   profile: ~/.protoagent/ebay-profile   # REQUIRED — this is what keeps you signed in
   headed: true
+  stealth: false                        # true if your eBay account signs in through Google (below)
   domain: www.ebay.com                  # www.ebay.co.uk, www.ebay.de, …
   amazon_domain: www.amazon.com
 ```
@@ -56,10 +57,27 @@ ebay:
 Then ask the agent to run `ebay_session_status`, and **sign in once** in the window that
 opens. The profile persists it.
 
-> `profile` and `headed` are **daemon-level** launch options in `agent-browser`. If a browser
-> daemon is already running under different options the CLI ignores them silently — so the
-> plugin raises instead of browsing as the wrong identity. `agent-browser close --all`, then
-> retry.
+### Signing in through Google
+
+Chrome sets `navigator.webdriver` when it is driven over CDP, and Google refuses to sign an
+account in from such a browser ("This browser or app may not be secure"). If your eBay account
+signs in through Google, set `stealth: true`: the browser launches with
+`--disable-blink-features=AutomationControlled` — the same flag protoAgent's core browser plugin
+uses for its stealth option — and nothing else changes. The browser still identifies as Chrome
+and runs at a human pace; this is not an attempt to defeat eBay's own checks. An eBay password
+or passkey login needs none of this.
+
+> `profile`, `headed` and `stealth` are **daemon-level** launch options in `agent-browser`. The
+> plugin sends them with every page open and the daemon reconciles them against the running
+> browser: unchanged → reused; changed → Chrome relaunches with the new options on the same
+> profile (a sign-in survives); daemon gone → one is respawned with them. So a fresh agent
+> process, a subagent with its own tool set, or a config change all converge on the right
+> browser with nothing to close by hand. (Through 0.2.0 the launch step was a URL-less `open`,
+> which the CLI turns into a second, option-less launch — every window it opened was replaced
+> within seconds by one on a throwaway profile. Fixed in 0.3.0.) If you ever do need to reset
+> the browser: `agent-browser close --session ebay`, never `close --all`, which also kills
+> every other plugin's browser. Two instances that need *different* profiles need different
+> `session` names too — one session reconciles to whichever instance opened it last.
 
 ## Tools
 

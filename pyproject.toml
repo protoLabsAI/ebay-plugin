@@ -1,6 +1,6 @@
 [project]
 name = "ebay-plugin"
-version = "0.2.0"
+version = "0.3.0"
 description = "Marketplace price research (eBay + Amazon) + seller economics for protoAgent, via a browser session"
 requires-python = ">=3.11"
 
