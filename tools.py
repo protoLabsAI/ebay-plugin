@@ -180,7 +180,7 @@ def _fetch(browser: Browser, url: str, *, sold: bool):
 
 
 def _as_bool(value, default: bool) -> bool:
-    """A YAML/console flag: real bools pass through; the strings "false"/"no"/"0" mean False."""
+    """A YAML/console flag: real bools pass through; the strings "false"/"no"/"0"/"off" mean False."""
     if value is None:
         return default
     if isinstance(value, str):
