@@ -886,9 +886,25 @@ class TestOwnTabFollowUps:
             ("https://www.ebay.com/", "https://www.ebay.com/", False),
             # a search page that states no terms (an eBay rewrite) is not judged a different search
             ("https://www.ebay.com/sch/i.html?LH_Sold=1", "https://www.ebay.com/sch/i.html?_nkw=x&LH_Sold=1", False),
+            # `domain: ebay.com` configured without www: eBay lands on www — the same-search check still applies
+            ("https://www.ebay.com/sch/i.html?_nkw=other", "https://ebay.com/sch/i.html?_nkw=x", True),
+            ("https://www.ebay.com/sch/i.html?_nkw=x", "https://ebay.com/sch/i.html?_nkw=x", False),
+            # a search landing on a sign-in SUBDOMAIN is a hop, not a different search
+            ("https://signin.ebay.com/sch/i.html?_nkw=other", "https://www.ebay.com/sch/i.html?_nkw=x", False),
         ],
     )
     def test_a_search_must_be_answered_by_our_search(self, landed, requested, hijacked):
         from ebay_plugin.tools import _hijacked
 
         assert _hijacked({"url": landed}, requested) is hijacked
+
+
+def test_a_same_site_misfire_still_settles(monkeypatch):
+    """Review of #4 (FP2): only a different SITE counts as settled. A same-site page flagged by
+    the same-search rule that is also still loading must settle, not fail as "no results list"."""
+    import ebay_plugin.tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "_SETTLE_S", 0)
+    loading = {"url": "https://www.ebay.com/sch/i.html?_nkw=other", "found_container": False, "count": 0}
+    assert tools_mod._is_undecided(loading, _EBAY) is True
+    assert tools_mod._is_undecided(_PANEL_READ, _EBAY) is False

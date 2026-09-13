@@ -75,7 +75,7 @@ def _is_undecided(data, url: str = "") -> bool:
     """True while the page shows neither results nor a reason — i.e. mid-redirect. A read that
     came from a tab not showing the site we asked for is DECIDED: waiting will not change it,
     the tab has to be taken back, so the settle loop must not spin on it."""
-    if isinstance(data, dict) and _hijacked(data, url):
+    if isinstance(data, dict) and _foreign_host(data, url):
         return False
     return isinstance(data, dict) and not any(
         (data.get("count"), data.get("found_container"), data.get("signin_wall"), data.get("challenge"))
@@ -215,6 +215,17 @@ def _search_term(parsed) -> tuple[str, str] | None:
     return None
 
 
+def _foreign_host(data, url: str) -> bool:
+    """The read came from a different SITE than the one requested (the Gemini panel, about:blank,
+    an unrelated tab). Only this counts as "decided" for the settle loop: a same-site page that
+    is still loading must still be allowed to settle."""
+    if not isinstance(data, dict) or not data.get("url") or not url:
+        return False
+    want = _site(urlparse(url).hostname or "")
+    host = (urlparse(str(data["url"])).hostname or "").lower()
+    return bool(want) and not (host == want or host.endswith("." + want))
+
+
 def _hijacked(data, url: str) -> bool:
     """The script ran in a tab that is not showing what we navigated to — the Gemini panel,
     about:blank, an operator's tab that took the active slot. Subdomains of the requested
@@ -232,7 +243,7 @@ def _hijacked(data, url: str) -> bool:
     if not (host == want or host.endswith("." + want)):
         return True
     wanted = _search_term(want_p)
-    if wanted is None or host != (want_p.hostname or "").lower():
+    if wanted is None or _site(host) != want:
         return False  # not a search, or a sign-in / challenge hop on a subdomain: not judged here
     if got_p.path.startswith(("/itm/", "/dp/", "/gp/product/")):
         return True  # an item page answered a search
