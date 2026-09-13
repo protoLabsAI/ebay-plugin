@@ -65,6 +65,10 @@ market claim.
   with it.
 - **challenge page** → eBay wants a human interaction; ask the operator to complete it. If
   it recurs, suggest raising `ebay.min_interval_s`.
+- **net::ERR_BLOCKED_BY_CLIENT** on a navigation → something other than a web page held the
+  browser tab (Chrome's Gemini side panel does this on its own). The tools repair the tab and
+  retry once by themselves; if it still fails, retry the call once, then stop and report it —
+  this is not an eBay problem and not a market finding.
 - **couldn't find the results list** → eBay changed its markup. Run `ebay_page_probe` on the
   URL and report what it shows. This is a bug to file, not a market finding.
 

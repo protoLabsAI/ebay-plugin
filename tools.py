@@ -71,7 +71,11 @@ _SETTLE_TRIES = 5
 
 
 def _is_undecided(data) -> bool:
-    """True while the page shows neither results nor a reason — i.e. mid-redirect."""
+    """True while the page shows neither results nor a reason — i.e. mid-redirect. A read that
+    ran on the Gemini panel (or another non-page target) is DECIDED: waiting will not change it,
+    the tab has to be repaired, so the settle loop must not spin on it."""
+    if isinstance(data, dict) and _hijacked(data):
+        return False
     return isinstance(data, dict) and not any(
         (data.get("count"), data.get("found_container"), data.get("signin_wall"), data.get("challenge"))
     )
@@ -150,6 +154,14 @@ def _fetch(browser: Browser, url: str, *, sold: bool):
         data = browser.eval_json(RESULT_JS)
     if not isinstance(data, dict):
         raise EbayError(f"unexpected response while reading {url}")
+    if _hijacked(data) and browser.ensure_page_tab():
+        # The page we read was not ours (Chrome's Gemini panel took the tab after we navigated).
+        # The tab is repaired; navigate and read once more rather than report a false "no results".
+        browser.open(url)
+        browser.wait_for(_RESULTS_SELECTOR)
+        data = browser.eval_json(RESULT_JS)
+        if not isinstance(data, dict):
+            raise EbayError(f"unexpected response while reading {url}")
     if data.get("signin_wall"):
         raise EbayError(
             "eBay redirected to its sign-in page. The sold-listings view needs a signed-in "
@@ -177,6 +189,13 @@ def _fetch(browser: Browser, url: str, *, sold: bool):
         )
     listings, dropped = normalize(data.get("rows") or [], sold=sold)
     return listings, dropped, _page_meta(data)
+
+
+def _hijacked(data: dict) -> bool:
+    """The script ran somewhere that is not a marketplace page — the Gemini side panel, or a
+    chrome:// / devtools:// target that took the active tab."""
+    url = str(data.get("url") or "")
+    return "gemini.google.com/glic" in url or url.startswith(("chrome://", "devtools://", "chrome-extension://"))
 
 
 def _page_meta(data: dict) -> dict:

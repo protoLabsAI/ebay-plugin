@@ -620,3 +620,102 @@ class TestPaddedResults:
         for key in ("headline_count", "related_rows_excluded", "query_rewritten"):
             assert key in RESULT_JS
         assert "Results matching fewer words" in RESULT_JS or "results matching fewer words" in RESULT_JS
+
+
+def _tab_cli(monkeypatch, tab_lists, *, open_results=None):
+    """A CLI stub whose `tab list` answers come from `tab_lists` in order (the last repeats)
+    and whose `open` answers come from `open_results` in order (default: success)."""
+    monkeypatch.setattr(browser_mod.shutil, "which", lambda b: "/usr/bin/agent-browser")
+    calls, lists, opens = [], list(tab_lists), list(open_results or [])
+
+    def fake(args, timeout):
+        calls.append(args)
+        if args[1:3] == ["tab", "list"]:
+            tabs = lists.pop(0) if len(lists) > 1 else (lists[0] if lists else [])
+            return browser_mod.Result(True, json.dumps({"success": True, "data": {"tabs": tabs}}), "")
+        if args[1] == "open" and args[2] != "about:blank" and opens:
+            return opens.pop(0)
+        return browser_mod.Result(True, "✓ Done\n", "")
+
+    monkeypatch.setattr(browser_mod, "_run", fake)
+    return calls
+
+
+_PAGE = {"tabId": "t1", "type": "page", "url": "https://www.ebay.com/", "active": True}
+_PANEL = {"tabId": "t2", "type": "webview", "url": "https://gemini.google.com/glic?hl=en-US", "active": True}
+
+
+class TestGeminiPanel:
+    """Chrome 149's Gemini side panel opens on its own as a `webview` target and the pinned CLI
+    makes it the ACTIVE tab; every navigation then fails with ERR_BLOCKED_BY_CLIENT. Seen live
+    on 2026-09-13: one item priced, then the run stopped."""
+
+    def test_a_normal_active_tab_costs_one_tab_list_and_nothing_else(self, monkeypatch, tmp_path):
+        calls = _tab_cli(monkeypatch, [[_PAGE]])
+        b = Browser(profile=str(tmp_path), min_interval_s=0)
+        b.open("https://www.ebay.com/sch/i.html?_nkw=x")
+        assert not any(c[1:3] == ["tab", "close"] for c in calls)
+        assert [c[2] for c in calls if c[1] == "open"][-1].startswith("https://www.ebay.com/sch")
+
+    def test_the_panel_is_closed_and_the_page_reselected_before_navigating(self, monkeypatch, tmp_path):
+        page = dict(_PAGE, active=False)
+        calls = _tab_cli(monkeypatch, [[page, _PANEL]])
+        b = Browser(profile=str(tmp_path), min_interval_s=0)
+        b.open("https://www.ebay.com/")
+        closes = [c for c in calls if c[1:3] == ["tab", "close"]]
+        assert [c[3] for c in closes] == ["t2"]
+        assert ["/usr/bin/agent-browser", "tab", "t1", "--session", "ebay"] in [c for c in calls] or any(
+            c[1:3] == ["tab", "t1"] for c in calls
+        )
+        nav = [i for i, c in enumerate(calls) if c[1] == "open" and c[2] == "https://www.ebay.com/"]
+        assert nav and nav[0] > calls.index(closes[0])  # repaired BEFORE navigating
+
+    def test_no_page_left_opens_a_new_tab(self, monkeypatch, tmp_path):
+        calls = _tab_cli(monkeypatch, [[_PANEL]])
+        Browser(profile=str(tmp_path), min_interval_s=0).open("https://www.ebay.com/")
+        assert any(c[1:3] == ["tab", "new"] for c in calls)
+
+    def test_a_blocked_navigation_is_repaired_and_retried_once(self, monkeypatch, tmp_path):
+        blocked = browser_mod.Result(False, "", "✗ Navigation failed: net::ERR_BLOCKED_BY_CLIENT")
+        page = dict(_PAGE, active=False)
+        # first check: fine; then the panel appears before the navigation lands; after repair: fine
+        calls = _tab_cli(monkeypatch, [[_PAGE], [page, _PANEL], [_PAGE]], open_results=[blocked])
+        b = Browser(profile=str(tmp_path), min_interval_s=0)
+        b.open("https://www.ebay.com/sch/i.html?_nkw=x")  # must not raise
+        navs = [c for c in calls if c[1] == "open" and c[2].startswith("https://www.ebay.com/sch")]
+        assert len(navs) == 2
+
+    def test_a_blocked_navigation_with_nothing_to_repair_is_an_error(self, monkeypatch, tmp_path):
+        blocked = browser_mod.Result(False, "", "✗ Navigation failed: net::ERR_BLOCKED_BY_CLIENT")
+        _tab_cli(monkeypatch, [[_PAGE]], open_results=[blocked])
+        with pytest.raises(BrowserError, match="ERR_BLOCKED_BY_CLIENT"):
+            Browser(profile=str(tmp_path), min_interval_s=0).open("https://www.ebay.com/")
+
+    def test_the_panel_is_not_a_web_page(self):
+        assert Browser.is_web_page(_PAGE) and Browser.is_web_page({"type": "page", "url": "about:blank"})
+        assert not Browser.is_web_page(_PANEL)
+        assert not Browser.is_web_page({"type": "page", "url": "https://gemini.google.com/glic"})
+        assert not Browser.is_web_page({"type": "page", "url": "chrome://newtab/"})
+
+    def test_a_read_that_landed_on_the_panel_is_repaired_and_re_read(self, monkeypatch):
+        import ebay_plugin.tools as tools_mod
+
+        class Hijacked(_StubBrowser):
+            def __init__(self):
+                super().__init__(None)
+                self.reads = [dict(url="https://gemini.google.com/glic?hl=en-US", found_container=False), _GOOD_PAGE]
+                self.repairs = 0
+
+            def ensure_page_tab(self):
+                self.repairs += 1
+                return ["t2"]
+
+            def eval_json(self, script):
+                return self.reads.pop(0) if len(self.reads) > 1 else self.reads[0]
+
+        b = Hijacked()
+        monkeypatch.setattr(tools_mod, "Browser", lambda **kw: b)
+        monkeypatch.setattr(tools_mod, "_SETTLE_S", 0)
+        out = json.loads({t.name: t for t in build_tools({})}["ebay_price_check"].invoke({"query": "x"}))
+        assert out["ok"] is True and out["results_found"] == 2
+        assert b.repairs == 1 and len(b.opened) == 2

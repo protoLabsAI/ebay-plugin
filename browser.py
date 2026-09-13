@@ -35,6 +35,13 @@ from dataclasses import dataclass
 
 log = logging.getLogger("protoagent.plugins.ebay")
 
+#: Chrome's refusal when a navigation is issued to a target that is not an ordinary web page.
+_BLOCKED_MARKER = "ERR_BLOCKED_BY_CLIENT"
+#: Chrome 149's built-in Gemini side panel. It can open on its own in a headed window, as a
+#: ``webview`` target; the pinned agent-browser makes any newly discovered target the ACTIVE
+#: tab, so every later navigation goes into the panel and fails with ERR_BLOCKED_BY_CLIENT.
+_GEMINI_PANEL = "gemini.google.com/glic"
+
 #: Chrome flag that clears ``navigator.webdriver``, which Chrome sets under CDP control and
 #: which Google's sign-in refuses ("this browser or app may not be secure"). The same flag
 #: protoAgent's core browser plugin uses for its ``stealth`` option — and nothing more.
@@ -146,13 +153,70 @@ class Browser:
         _run(self._cmd("close"), timeout=self.timeout_s)
         self._session_ready = False
 
+    # ── tab hygiene ─────────────────────────────────────────────────────────────
+    def _tabs(self) -> list[dict]:
+        res = _run(self._cmd("tab", "list", "--json"), timeout=self.timeout_s)
+        if not res.ok:
+            return []
+        try:
+            payload = json.loads((res.stdout or "").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return []
+        tabs = (payload.get("data") or {}).get("tabs") if isinstance(payload, dict) else None
+        return tabs if isinstance(tabs, list) else []
+
+    @staticmethod
+    def is_web_page(tab: dict) -> bool:
+        """An ordinary tab we can navigate: a ``page`` target on http(s) or about:blank, and not
+        the Gemini side panel."""
+        url = str(tab.get("url") or "")
+        return (
+            str(tab.get("type") or "page") == "page"
+            and (url.startswith(("http://", "https://")) or url == "about:blank")
+            and _GEMINI_PANEL not in url
+        )
+
+    def ensure_page_tab(self) -> list[str]:
+        """Make the session's active tab an ordinary web page again if something stole it.
+
+        Closes every non-page target (the Gemini panel is the one seen in the wild), selects the
+        first remaining web page, or opens a new tab when none is left. Returns the ids it
+        closed — empty when the active tab was already fine, which is the common case and costs
+        one ``tab list``."""
+        tabs = self._tabs()
+        active = next((t for t in tabs if t.get("active")), None)
+        if not tabs or (active is not None and self.is_web_page(active)):
+            return []
+        closed = []
+        for t in tabs:
+            if (
+                not self.is_web_page(t)
+                and t.get("tabId")
+                and _run(self._cmd("tab", "close", str(t["tabId"])), timeout=self.timeout_s).ok
+            ):
+                closed.append(str(t["tabId"]))
+        pages = [t for t in tabs if self.is_web_page(t) and str(t.get("tabId")) not in closed]
+        if pages:
+            _run(self._cmd("tab", str(pages[0]["tabId"])), timeout=self.timeout_s)
+        else:
+            _run(self._cmd("tab", "new"), timeout=self.timeout_s)
+        log.warning(
+            "[ebay] the browser's active tab was not a web page (closed %s) — restored an ordinary tab",
+            closed or "none",
+        )
+        return closed or ["(reselected)"]
+
     # ── actions ─────────────────────────────────────────────────────────────────
     def open(self, url: str) -> None:
         self.ensure_session()
         self._pace()
+        self.ensure_page_tab()
         # Flags on every navigation: a daemon that died (an operator's `close`, a newer
         # CLI's idle timeout) respawns with our profile instead of a blank one.
         res = _run(self._open_cmd(url), timeout=self.timeout_s)
+        if not res.ok and _BLOCKED_MARKER in (res.stderr + res.stdout) and self.ensure_page_tab():
+            # Something took the tab between our check and the navigation — repaired; once more.
+            res = _run(self._open_cmd(url), timeout=self.timeout_s)
         if not res.ok:
             raise BrowserError(f"could not open {url}: {(res.stderr or res.stdout).strip()}")
 
