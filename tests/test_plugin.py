@@ -83,15 +83,19 @@ def _opens(calls):
 
 
 class TestBrowserSession:
-    def test_the_launch_is_an_open_with_a_url_never_a_bare_open(self, monkeypatch, tmp_path):
+    def test_the_launch_is_the_labelled_tab_and_navigates_nothing(self, monkeypatch, tmp_path):
         """A URL-less `open` with flags makes the CLI send a SECOND, option-less launch and the
         daemon relaunches Chrome on a throwaway profile — the 0.2.0 bug that kept the profile
         from ever holding a cookie. `open about:blank` sends exactly one full-options launch."""
         calls = _cli(monkeypatch)
         Browser(profile=str(tmp_path)).ensure_session()
-        (launch,) = _opens(calls)
-        assert launch[2] == "about:blank"
-        assert all(c[1] != "open" or c[2].startswith(("about:", "http")) for c in calls)
+        # The launch takes the plugin's own labelled tab with the flags attached. It never
+        # navigates: the old `open about:blank` launch blanked whatever tab was active, which
+        # could be the operator's. And never a URL-less `open` (the 0.2.0 double launch).
+        (launch,) = calls
+        assert launch[1:3] == ["tab", "ebaytab"]
+        assert launch[launch.index("--profile") + 1] == str(tmp_path) and launch[-2:] == ["--session", "ebay"]
+        assert not any(c[1] == "open" for c in calls)
 
     def test_launch_flags_ride_on_every_navigation(self, monkeypatch, tmp_path):
         """The daemon reconciles the flags against the running browser on each open: same →
@@ -104,7 +108,6 @@ class TestBrowserSession:
         b.open("https://www.ebay.com/sch/i.html?_nkw=x")
         opens = _opens(calls)
         assert [c[2] for c in opens] == [
-            "about:blank",
             "https://www.ebay.com/",
             "https://www.ebay.com/sch/i.html?_nkw=x",
         ]
@@ -117,16 +120,16 @@ class TestBrowserSession:
     def test_stealth_adds_the_automation_flag_only_when_asked(self, monkeypatch, tmp_path):
         calls = _cli(monkeypatch)
         Browser(profile=str(tmp_path)).ensure_session()
-        assert "--args" not in _opens(calls)[0]
+        assert "--args" not in calls[0]
         calls = _cli(monkeypatch)
         Browser(profile=str(tmp_path), stealth=True).ensure_session()
-        launch = _opens(calls)[0]
+        launch = calls[0]
         assert launch[launch.index("--args") + 1] == _STEALTH
 
     def test_no_profile_sends_no_profile_flag(self, monkeypatch):
         calls = _cli(monkeypatch)
         Browser(profile="", headed=False).ensure_session()
-        launch = _opens(calls)[0]
+        launch = calls[0]
         assert "--profile" not in launch
         assert "--headed" not in launch
 
@@ -154,7 +157,7 @@ class TestBrowserSession:
         b = Browser(profile=str(tmp_path))
         b.ensure_session()
         b.ensure_session()
-        assert len(_opens(calls)) == 1
+        assert len(calls) == 1
 
     def test_close_is_scoped_to_our_session(self, monkeypatch, tmp_path):
         calls = _cli(monkeypatch)
@@ -622,100 +625,197 @@ class TestPaddedResults:
         assert "Results matching fewer words" in RESULT_JS or "results matching fewer words" in RESULT_JS
 
 
-def _tab_cli(monkeypatch, tab_lists, *, open_results=None):
-    """A CLI stub whose `tab list` answers come from `tab_lists` in order (the last repeats)
-    and whose `open` answers come from `open_results` in order (default: success)."""
+_BLOCKED = "⚠ --profile, --headed ignored: daemon already running.\n✗ Navigation failed: net::ERR_BLOCKED_BY_CLIENT"
+
+
+def _tab_cli(monkeypatch, *, has_label=True, tabs=None, open_results=None):
+    """A CLI stub that knows the plugin's labelled tab: `tab ebaytab` succeeds only once the
+    label exists, `tab new --label` creates it, `tab list` answers `tabs`, `open` answers
+    `open_results` in order (then success)."""
     monkeypatch.setattr(browser_mod.shutil, "which", lambda b: "/usr/bin/agent-browser")
-    calls, lists, opens = [], list(tab_lists), list(open_results or [])
+    calls, state, opens = [], {"label": has_label}, list(open_results or [])
+    ok = browser_mod.Result(True, "✓ Done\n", "")
 
     def fake(args, timeout):
         calls.append(args)
-        if args[1:3] == ["tab", "list"]:
-            tabs = lists.pop(0) if len(lists) > 1 else (lists[0] if lists else [])
-            return browser_mod.Result(True, json.dumps({"success": True, "data": {"tabs": tabs}}), "")
-        if args[1] == "open" and args[2] != "about:blank" and opens:
+        sub = args[1:]
+        if sub[:2] == ["tab", "list"]:
+            return browser_mod.Result(True, json.dumps({"success": True, "data": {"tabs": tabs or []}}), "")
+        if sub[:2] == ["tab", "new"]:
+            state["label"] = True
+            return ok
+        if sub[:2] == ["tab", "ebaytab"]:
+            if state["label"]:
+                return ok
+            return browser_mod.Result(False, "", "✗ No tab with label `ebaytab`; run `agent-browser tab`")
+        if sub[0] == "open" and opens:
             return opens.pop(0)
-        return browser_mod.Result(True, "✓ Done\n", "")
+        return ok
 
     monkeypatch.setattr(browser_mod, "_run", fake)
     return calls
 
 
-_PAGE = {"tabId": "t1", "type": "page", "url": "https://www.ebay.com/", "active": True}
-_PANEL = {"tabId": "t2", "type": "webview", "url": "https://gemini.google.com/glic?hl=en-US", "active": True}
+def _idx(calls, pred):
+    return [i for i, c in enumerate(calls) if pred(c)]
 
 
-class TestGeminiPanel:
-    """Chrome 149's Gemini side panel opens on its own as a `webview` target and the pinned CLI
-    makes it the ACTIVE tab; every navigation then fails with ERR_BLOCKED_BY_CLIENT. Seen live
-    on 2026-09-13: one item priced, then the run stopped."""
+class TestOwnTab:
+    """The plugin navigates only its own labelled tab. Seen live 2026-09-13: Chrome's Gemini side
+    panel (a `webview`) took the active tab and every navigation failed ERR_BLOCKED_BY_CLIENT;
+    review of the first fix showed it would also have navigated or closed the operator's tabs."""
 
-    def test_a_normal_active_tab_costs_one_tab_list_and_nothing_else(self, monkeypatch, tmp_path):
-        calls = _tab_cli(monkeypatch, [[_PAGE]])
+    def test_every_navigation_switches_to_the_plugins_tab_first(self, monkeypatch, tmp_path):
+        calls = _tab_cli(monkeypatch)
         b = Browser(profile=str(tmp_path), min_interval_s=0)
-        b.open("https://www.ebay.com/sch/i.html?_nkw=x")
-        assert not any(c[1:3] == ["tab", "close"] for c in calls)
-        assert [c[2] for c in calls if c[1] == "open"][-1].startswith("https://www.ebay.com/sch")
+        b.open("https://www.ebay.com/a")
+        b.open("https://www.ebay.com/b")
+        opens = _idx(calls, lambda c: c[1] == "open")
+        assert len(opens) == 2
+        for i in opens:
+            assert calls[i - 1][1:3] == ["tab", "ebaytab"]  # the switch immediately precedes each navigation
+        assert not _idx(calls, lambda c: c[1:3] in (["tab", "list"], ["tab", "close"], ["tab", "new"]))
+        for c in calls:
+            if c[1:3] == ["tab", "ebaytab"]:
+                assert "--profile" in c and "--headed" in c  # a dead daemon relaunches with OUR options
 
-    def test_the_panel_is_closed_and_the_page_reselected_before_navigating(self, monkeypatch, tmp_path):
-        page = dict(_PAGE, active=False)
-        calls = _tab_cli(monkeypatch, [[page, _PANEL]])
-        b = Browser(profile=str(tmp_path), min_interval_s=0)
-        b.open("https://www.ebay.com/")
-        closes = [c for c in calls if c[1:3] == ["tab", "close"]]
-        assert [c[3] for c in closes] == ["t2"]
-        assert ["/usr/bin/agent-browser", "tab", "t1", "--session", "ebay"] in [c for c in calls] or any(
-            c[1:3] == ["tab", "t1"] for c in calls
-        )
-        nav = [i for i, c in enumerate(calls) if c[1] == "open" and c[2] == "https://www.ebay.com/"]
-        assert nav and nav[0] > calls.index(closes[0])  # repaired BEFORE navigating
-
-    def test_no_page_left_opens_a_new_tab(self, monkeypatch, tmp_path):
-        calls = _tab_cli(monkeypatch, [[_PANEL]])
+    def test_a_missing_tab_is_created_with_the_label_not_by_navigating_another(self, monkeypatch, tmp_path):
+        calls = _tab_cli(monkeypatch, has_label=False)
         Browser(profile=str(tmp_path), min_interval_s=0).open("https://www.ebay.com/")
-        assert any(c[1:3] == ["tab", "new"] for c in calls)
+        new = _idx(calls, lambda c: c[1:4] == ["tab", "new", "--label"])
+        assert len(new) == 1 and calls[new[0]][4] == "ebaytab"
+        assert new[0] < _idx(calls, lambda c: c[1] == "open")[0]
+        assert [c[2] for c in calls if c[1] == "open"] == ["https://www.ebay.com/"]  # no about:blank navigation
 
-    def test_a_blocked_navigation_is_repaired_and_retried_once(self, monkeypatch, tmp_path):
-        blocked = browser_mod.Result(False, "", "✗ Navigation failed: net::ERR_BLOCKED_BY_CLIENT")
-        page = dict(_PAGE, active=False)
-        # first check: fine; then the panel appears before the navigation lands; after repair: fine
-        calls = _tab_cli(monkeypatch, [[_PAGE], [page, _PANEL], [_PAGE]], open_results=[blocked])
-        b = Browser(profile=str(tmp_path), min_interval_s=0)
-        b.open("https://www.ebay.com/sch/i.html?_nkw=x")  # must not raise
-        navs = [c for c in calls if c[1] == "open" and c[2].startswith("https://www.ebay.com/sch")]
-        assert len(navs) == 2
+    def test_only_chrome_panels_are_ever_closed(self, monkeypatch, tmp_path):
+        tabs = [
+            {"tabId": "t1", "type": "page", "url": "https://mail.google.com/", "active": False},
+            {"tabId": "t2", "type": "page", "url": "file:///Users/op/receipt.pdf", "active": False},
+            {"tabId": "t3", "type": "page", "url": "view-source:https://www.ebay.com/", "active": False},
+            {"tabId": "t4", "type": "page", "url": "https://www.ebay.com/", "label": "ebaytab", "active": False},
+            {"tabId": "t5", "type": "webview", "url": "https://gemini.google.com/glic?hl=en-US", "active": True},
+            {"tabId": "t6", "type": "page", "url": "https://gemini.google.com/glic", "active": False},
+        ]
+        calls = _tab_cli(monkeypatch, tabs=tabs)
+        assert Browser(profile=str(tmp_path)).close_panels() == ["t5", "t6"]
+        assert sorted(c[3] for c in calls if c[1:3] == ["tab", "close"]) == ["t5", "t6"]
 
-    def test_a_blocked_navigation_with_nothing_to_repair_is_an_error(self, monkeypatch, tmp_path):
-        blocked = browser_mod.Result(False, "", "✗ Navigation failed: net::ERR_BLOCKED_BY_CLIENT")
-        _tab_cli(monkeypatch, [[_PAGE]], open_results=[blocked])
+    def test_a_blocked_navigation_takes_the_tab_back_then_retries_once(self, monkeypatch, tmp_path):
+        panel = {"tabId": "t9", "type": "webview", "url": "https://gemini.google.com/glic", "active": True}
+        blocked = browser_mod.Result(False, "", _BLOCKED)
+        calls = _tab_cli(monkeypatch, tabs=[panel], open_results=[blocked])
+        Browser(profile=str(tmp_path), min_interval_s=0).open("https://www.ebay.com/sch/i.html?_nkw=x")
+        first, second = _idx(calls, lambda c: c[1] == "open")
+        between = [c[1:4] for c in calls[first + 1 : second]]
+        assert between[0][:2] == ["tab", "list"]
+        assert between[1] == ["tab", "close", "t9"]  # the panel is closed…
+        assert between[-1][:2] == ["tab", "ebaytab"]  # …and our tab reselected, BEFORE the retry
+
+    def test_a_second_blocked_navigation_is_an_error(self, monkeypatch, tmp_path):
+        blocked = browser_mod.Result(False, "", _BLOCKED)
+        calls = _tab_cli(monkeypatch, open_results=[blocked, blocked])
         with pytest.raises(BrowserError, match="ERR_BLOCKED_BY_CLIENT"):
             Browser(profile=str(tmp_path), min_interval_s=0).open("https://www.ebay.com/")
+        assert len(_idx(calls, lambda c: c[1] == "open")) == 2
 
-    def test_the_panel_is_not_a_web_page(self):
-        assert Browser.is_web_page(_PAGE) and Browser.is_web_page({"type": "page", "url": "about:blank"})
-        assert not Browser.is_web_page(_PANEL)
-        assert not Browser.is_web_page({"type": "page", "url": "https://gemini.google.com/glic"})
-        assert not Browser.is_web_page({"type": "page", "url": "chrome://newtab/"})
+    def test_a_failed_tab_switch_names_the_cli_reason(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(browser_mod.shutil, "which", lambda b: "/usr/bin/agent-browser")
+        monkeypatch.setattr(
+            browser_mod, "_run", lambda args, timeout: browser_mod.Result(False, "", "⚠ noise\n✗ Chrome exited")
+        )
+        with pytest.raises(BrowserError, match=r"could not start the browser: Chrome exited$"):
+            Browser(profile=str(tmp_path)).ensure_session()
 
-    def test_a_read_that_landed_on_the_panel_is_repaired_and_re_read(self, monkeypatch):
+
+class _Reads(_StubBrowser):
+    """A stub browser that answers a scripted sequence of reads and counts reclaims."""
+
+    def __init__(self, *reads):
+        super().__init__(None)
+        self.reads, self.refocused = list(reads), 0
+
+    def refocus(self):
+        self.refocused += 1
+        return "switched"
+
+    def eval_json(self, script):
+        return self.reads.pop(0) if len(self.reads) > 1 else self.reads[0]
+
+
+_EBAY = "https://www.ebay.com/sch/i.html?_nkw=x"
+_PANEL_READ = {"url": "https://gemini.google.com/glic?hl=en-US", "found_container": False}
+
+
+class TestReadsFromAnotherTab:
+    def test_a_reclaimed_read_goes_through_the_settle_loop(self, monkeypatch):
+        """Review finding: the first fix re-read ONCE after repairing, so a re-read that landed
+        mid-redirect (eBay's captcha hop) failed as "couldn't find the results list"."""
         import ebay_plugin.tools as tools_mod
 
-        class Hijacked(_StubBrowser):
-            def __init__(self):
-                super().__init__(None)
-                self.reads = [dict(url="https://gemini.google.com/glic?hl=en-US", found_container=False), _GOOD_PAGE]
-                self.repairs = 0
-
-            def ensure_page_tab(self):
-                self.repairs += 1
-                return ["t2"]
-
-            def eval_json(self, script):
-                return self.reads.pop(0) if len(self.reads) > 1 else self.reads[0]
-
-        b = Hijacked()
+        mid_redirect = {"url": _EBAY, "found_container": False, "count": 0}
+        b = _Reads(_PANEL_READ, mid_redirect, dict(_GOOD_PAGE, url=_EBAY))
         monkeypatch.setattr(tools_mod, "Browser", lambda **kw: b)
         monkeypatch.setattr(tools_mod, "_SETTLE_S", 0)
         out = json.loads({t.name: t for t in build_tools({})}["ebay_price_check"].invoke({"query": "x"}))
         assert out["ok"] is True and out["results_found"] == 2
-        assert b.repairs == 1 and len(b.opened) == 2
+        assert b.refocused == 1 and len(b.opened) == 2
+
+    def test_session_status_never_reports_signed_out_when_another_tab_answered(self, monkeypatch):
+        import ebay_plugin.tools as tools_mod
+
+        b = _Reads(_PANEL_READ)
+        monkeypatch.setattr(tools_mod, "Browser", lambda **kw: b)
+        out = json.loads({t.name: t for t in build_tools({})}["ebay_session_status"].invoke({}))
+        assert out["ok"] is False and "could not check" in out["error"] and "signed_in" not in out
+        assert b.refocused == 1
+
+    def test_session_status_recovers_after_one_reclaim(self, monkeypatch):
+        import ebay_plugin.tools as tools_mod
+
+        b = _Reads(_PANEL_READ, {"url": "https://www.ebay.com/", "signed_in": True, "greeting": "Hi joshua!"})
+        monkeypatch.setattr(tools_mod, "Browser", lambda **kw: b)
+        out = json.loads({t.name: t for t in build_tools({})}["ebay_session_status"].invoke({}))
+        assert out["signed_in"] is True and b.refocused == 1
+
+    def test_page_probe_says_where_it_landed(self, monkeypatch):
+        import ebay_plugin.tools as tools_mod
+
+        b = _Reads(_PANEL_READ)
+        monkeypatch.setattr(tools_mod, "Browser", lambda **kw: b)
+        out = json.loads({t.name: t for t in build_tools({})}["ebay_page_probe"].invoke({"url": _EBAY}))
+        assert out["not_the_requested_site"] is True and "gemini" in out["landed_url"]
+
+    def test_the_amazon_read_is_reclaimed_too(self, monkeypatch):
+        import ebay_plugin.tools as tools_mod
+
+        monkeypatch.setattr(tools_mod, "_SETTLE_S", 0)
+        good = {"url": "https://www.amazon.com/s?k=x", "found_container": True, "count": 1, "rows": []}
+        b = _Reads(_PANEL_READ, good)
+        assert tools_mod._read(b, "https://www.amazon.com/s?k=x", "JS", "sel")["url"].startswith(
+            "https://www.amazon.com"
+        )
+        assert b.refocused == 1
+
+    @pytest.mark.parametrize(
+        "landed,requested,hijacked",
+        [
+            ("https://www.ebay.com/sch/x", _EBAY, False),
+            ("https://signin.ebay.com/ws/x", _EBAY, False),
+            ("https://www.ebay.com/splashui/captcha", _EBAY, False),
+            ("https://www.ebay.co.uk/sch/x", "https://www.ebay.co.uk/sch/y", False),
+            ("https://www.amazon.com/ap/signin", "https://www.amazon.com/s?k=x", False),
+            ("https://gemini.google.com/glic?hl=en-US", _EBAY, True),
+            ("about:blank", _EBAY, True),
+            ("https://mail.google.com/", _EBAY, True),
+            ("https://notebay.com/", _EBAY, True),
+        ],
+    )
+    def test_hijack_is_judged_by_host(self, landed, requested, hijacked):
+        from ebay_plugin.tools import _hijacked
+
+        assert _hijacked({"url": landed}, requested) is hijacked
+
+    def test_a_read_without_a_url_is_not_judged(self):
+        from ebay_plugin.tools import _hijacked
+
+        assert _hijacked({"found_container": True}, _EBAY) is False
