@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from urllib.parse import urlparse
 
 from . import amazon
 from .browser import Browser, BrowserError
@@ -70,8 +71,12 @@ _SETTLE_S = 2.0
 _SETTLE_TRIES = 5
 
 
-def _is_undecided(data) -> bool:
-    """True while the page shows neither results nor a reason — i.e. mid-redirect."""
+def _is_undecided(data, url: str = "") -> bool:
+    """True while the page shows neither results nor a reason — i.e. mid-redirect. A read that
+    came from a tab not showing the site we asked for is DECIDED: waiting will not change it,
+    the tab has to be taken back, so the settle loop must not spin on it."""
+    if isinstance(data, dict) and _hijacked(data, url):
+        return False
     return isinstance(data, dict) and not any(
         (data.get("count"), data.get("found_container"), data.get("signin_wall"), data.get("challenge"))
     )
@@ -108,19 +113,43 @@ def _classify(data, url: str, *, marketplace: str) -> None:
         )
 
 
-def _read(browser: Browser, url: str, script: str, selector: str):
-    """Navigate, wait for results, and re-read while the page is still mid-redirect."""
-    browser.open(url)
-    browser.wait_for(selector)
-    data = browser.eval_json(script)
+def _settle(browser: Browser, script: str, data, url: str):
+    """Re-read while the page is still mid-redirect (see _is_undecided), a bounded number of times."""
     for _ in range(_SETTLE_TRIES):
-        if not _is_undecided(data):
+        if not _is_undecided(data, url):
             break
         time.sleep(_SETTLE_S)
         data = browser.eval_json(script)
+    return data
+
+
+def _read_page(browser: Browser, url: str, script: str, selector: str | None = None, *, settle: bool = True):
+    """Navigate, wait, read and settle — the one read path every tool uses.
+
+    If the read came from a tab that is not showing the site we navigated to (Chrome's Gemini
+    side panel, or an operator's tab that took the active slot), take the plugin's tab back,
+    navigate again and read again through the SAME wait + settle steps. Once: a second
+    hijack is reported, not chased."""
+
+    def attempt():
+        browser.open(url)
+        if selector:
+            browser.wait_for(selector)
+        data = browser.eval_json(script)
+        return _settle(browser, script, data, url) if settle else data
+
+    data = attempt()
+    if _hijacked(data, url):
+        browser.refocus()
+        data = attempt()
     if not isinstance(data, dict):
         raise EbayError(f"unexpected response while reading {url}")
     return data
+
+
+def _read(browser: Browser, url: str, script: str, selector: str):
+    """Navigate, wait for results, and re-read while the page is still mid-redirect."""
+    return _read_page(browser, url, script, selector)
 
 
 def _fetch_amazon(browser: Browser, url: str):
@@ -131,25 +160,14 @@ def _fetch_amazon(browser: Browser, url: str):
 
 def _fetch(browser: Browser, url: str, *, sold: bool):
     """Navigate and extract, mapping every not-actually-data outcome to a clear error."""
-    browser.open(url)
     # `open` returns once the requested URL loads, but eBay bounces a search through a CHAIN
     # — search → /splashui/captcha → signin → back to results — and a read taken mid-chain
     # sees no cards and none of the signals set. That in-between state got reported as "eBay
     # changed its markup, file a bug", sending the operator after a defect while the page was
     # still resolving. Waiting for the results container is exact where a guessed sleep is
-    # not: it returns the moment the page is ready, and a timeout is itself informative
-    # (the gate pages never render results), so we read and classify either way.
-    browser.wait_for(_RESULTS_SELECTOR)
-    data = browser.eval_json(RESULT_JS)
-    # Belt and braces for the case where the wait timed out but the page was merely slow:
-    # only re-read while the page still has nothing at all to say.
-    for _ in range(_SETTLE_TRIES):
-        if not _is_undecided(data):
-            break
-        time.sleep(_SETTLE_S)
-        data = browser.eval_json(RESULT_JS)
-    if not isinstance(data, dict):
-        raise EbayError(f"unexpected response while reading {url}")
+    # not, and the settle loop covers a wait that timed out on a merely slow page. The shared
+    # read path also takes the tab back if another tab answered (see _read_page).
+    data = _read_page(browser, url, RESULT_JS, _RESULTS_SELECTOR)
     if data.get("signin_wall"):
         raise EbayError(
             "eBay redirected to its sign-in page. The sold-listings view needs a signed-in "
@@ -177,6 +195,25 @@ def _fetch(browser: Browser, url: str, *, sold: bool):
         )
     listings, dropped = normalize(data.get("rows") or [], sold=sold)
     return listings, dropped, _page_meta(data)
+
+
+def _site(host: str) -> str:
+    host = (host or "").lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _hijacked(data, url: str) -> bool:
+    """The script ran in a tab that is not showing the site we navigated to — the Gemini panel,
+    about:blank, or an operator's tab that took the active slot. Subdomains of the requested
+    site (signin.ebay.com, the /splashui/ challenge pages) are the site. A read without a url
+    (older payloads, test stubs) is not judged."""
+    if not isinstance(data, dict) or not data.get("url") or not url:
+        return False
+    want = _site(urlparse(url).hostname or "")
+    host = (urlparse(str(data["url"])).hostname or "").lower()
+    if not want:
+        return False
+    return not (host == want or host.endswith("." + want))
 
 
 def _page_meta(data: dict) -> dict:
@@ -358,12 +395,23 @@ def build_tools(cfg: dict):
         one-time step.
         """
         b = _browser()
+        home = f"https://{domain}"
         try:
-            b.open(f"https://{domain}")
-            data = b.eval_json(SESSION_JS)
-        except BrowserError as exc:
+            data = _read_page(b, home, SESSION_JS, settle=False)
+        except (BrowserError, EbayError) as exc:
             return json.dumps({"ok": False, "error": str(exc)})
-        signed_in = bool(isinstance(data, dict) and data.get("signed_in"))
+        if _hijacked(data, home):
+            # Another tab answered twice. Saying "not signed in" here would send the operator to
+            # sign in again for nothing — say what actually happened instead.
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": f"could not check: the browser kept answering from {data.get('url')} instead of "
+                    f"{domain} (Chrome's Gemini side panel or another tab took the active slot). Close that "
+                    "panel or tab in the browser window and try again.",
+                }
+            )
+        signed_in = bool(data.get("signed_in"))
         next_step = ""
         if not signed_in:
             next_step = "Sign in to eBay in the browser window that just opened; the profile keeps you signed in."
@@ -393,15 +441,16 @@ def build_tools(cfg: dict):
         """
         b = _browser()
         try:
-            b.open(url)
-            data = b.eval_json(RESULT_JS)
-        except BrowserError as exc:
+            data = _read_page(b, url, RESULT_JS, settle=False)
+        except (BrowserError, EbayError) as exc:
             return json.dumps({"ok": False, "error": str(exc)})
         rows = (data or {}).get("rows") or []
         return json.dumps(
             {
                 "ok": True,
                 "url": url,
+                "landed_url": data.get("url"),
+                "not_the_requested_site": _hijacked(data, url),
                 "found_container": (data or {}).get("found_container"),
                 "challenge": (data or {}).get("challenge"),
                 "signin_wall": (data or {}).get("signin_wall"),

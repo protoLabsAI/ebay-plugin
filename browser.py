@@ -21,6 +21,18 @@ one on a profile nobody was signed in to, which is why the profile dir never hel
 (The CLI's ``⚠ … ignored: daemon already running`` warning is printed client-side whenever a
 daemon exists and flags were given; it is noise, not a signal — the daemon applied them.)
 Verified live against agent-browser 0.27.1 by watching Chrome's ``--user-data-dir``.
+
+**The plugin owns one labelled tab.** The window is shared with the operator (they sign in
+and browse there) and Chrome opens its own targets into it — the Gemini side panel, as a
+``webview``. agent-browser 0.27.1 makes any newly discovered target the ACTIVE tab and runs
+every command on the active tab, so navigating "the current tab" could mean navigating the
+panel (Chrome refuses: ``net::ERR_BLOCKED_BY_CLIENT``) or one of the operator's tabs. So the
+launch step is ``tab <label>`` / ``tab new --label <label>`` carrying the launch flags — the
+flags make the CLI send its full-options launch first, exactly as on ``open`` — and every
+navigation switches to that tab first. Nothing navigates a tab it did not create, and the
+only targets ever closed are Chrome's own panels, never an ordinary page. Verified live on a
+throwaway session: the labelled-tab command launched on the requested profile with the
+stealth argument, was reused on repeat, and ``open`` then landed in the labelled tab.
 """
 
 from __future__ import annotations
@@ -34,6 +46,15 @@ import time
 from dataclasses import dataclass
 
 log = logging.getLogger("protoagent.plugins.ebay")
+
+#: Chrome's refusal when a navigation is issued to a target that is not an ordinary web page.
+_BLOCKED_MARKER = "ERR_BLOCKED_BY_CLIENT"
+#: The one tab this plugin navigates (module docstring).
+_TAB_LABEL = "ebaytab"
+#: Chrome 149's built-in Gemini side panel. It can open on its own in a headed window, as a
+#: ``webview`` target; the pinned agent-browser makes any newly discovered target the ACTIVE
+#: tab, so every later navigation goes into the panel and fails with ERR_BLOCKED_BY_CLIENT.
+_GEMINI_PANEL = "gemini.google.com/glic"
 
 #: Chrome flag that clears ``navigator.webdriver``, which Chrome sets under CDP control and
 #: which Google's sign-in refuses ("this browser or app may not be secure"). The same flag
@@ -92,6 +113,7 @@ class Browser:
         self.min_interval_s = min_interval_s
         self._last_nav = 0.0
         self._session_ready = False
+        self.tab_label = _TAB_LABEL
 
     # ── plumbing ────────────────────────────────────────────────────────────────
     def _cmd(self, *args: str) -> list[str]:
@@ -130,29 +152,100 @@ class Browser:
     def ensure_session(self) -> None:
         """Bring the browser up with our options, once per instance.
 
-        ``open about:blank`` with the flags: the daemon starts, reuses, or relaunches as
-        needed (module docstring). Never a URL-less ``open`` — that is the double launch.
+        The launch is taking the plugin's own labelled tab with the flags attached: the daemon
+        starts, reuses, or relaunches as needed (module docstring), and no other tab is
+        navigated — the old ``open about:blank`` launch blanked whatever tab was active, which
+        could be the operator's. Never a URL-less ``open`` — that is the double launch.
         """
         if self._session_ready:
             return
         if reason := self.available():
             raise BrowserError(reason)
-        res = _run(self._open_cmd("about:blank"), timeout=self.timeout_s)
-        if not res.ok:
-            raise BrowserError(f"could not start the browser: {(res.stderr or res.stdout).strip()}")
+        try:
+            self.focus_own_tab()
+        except BrowserError as exc:
+            raise BrowserError(f"could not start the browser: {exc}") from None
         self._session_ready = True
 
     def close(self) -> None:
         _run(self._cmd("close"), timeout=self.timeout_s)
         self._session_ready = False
 
+    # ── tab ownership (module docstring) ────────────────────────────────────────
+    def _tab_cmd(self, *args: str) -> list[str]:
+        # Launch flags ride along: a daemon that died comes back with our profile instead of a
+        # default headless browser that the next navigation would then have to replace.
+        return [self.binary, "tab", *args, *self._launch_flags(), "--session", self.session]
+
+    @staticmethod
+    def _last_line(res: Result) -> str:
+        lines = [ln for ln in (res.stderr or res.stdout or "").strip().splitlines() if ln.strip()]
+        return lines[-1].lstrip("✗ ").strip() if lines else "no output from the browser CLI"
+
+    def _tabs(self) -> list[dict]:
+        res = _run(self._tab_cmd("list", "--json"), timeout=self.timeout_s)
+        if not res.ok:
+            return []
+        try:
+            payload = json.loads((res.stdout or "").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return []
+        tabs = (payload.get("data") or {}).get("tabs") if isinstance(payload, dict) else None
+        return tabs if isinstance(tabs, list) else []
+
+    @staticmethod
+    def is_panel(tab: dict) -> bool:
+        """Chrome's own target that takes the active slot — the Gemini side panel (a ``webview``,
+        or its URL in any target). An ordinary ``page`` is never a panel, whatever its URL:
+        file://, view-source: and the operator's own tabs are left alone."""
+        return str(tab.get("type") or "page") == "webview" or _GEMINI_PANEL in str(tab.get("url") or "")
+
+    def close_panels(self) -> list[str]:
+        """Close Chrome's panels (see :meth:`is_panel`) in this session. Returns the ids closed."""
+        closed = []
+        for t in self._tabs():
+            if (
+                self.is_panel(t)
+                and t.get("tabId")
+                and _run(self._tab_cmd("close", str(t["tabId"])), timeout=self.timeout_s).ok
+            ):
+                closed.append(str(t["tabId"]))
+        if closed:
+            log.warning("[ebay] closed Chrome panel target(s) %s that had taken the browser tab", closed)
+        return closed
+
+    def focus_own_tab(self) -> str:
+        """Make the plugin's labelled tab the active one: ``"switched"`` when it existed,
+        ``"created"`` when it had to be opened (first use, a relaunched browser, or the
+        operator closed it). Raises with the CLI's own reason when neither works."""
+        if _run(self._tab_cmd(self.tab_label), timeout=self.timeout_s).ok:
+            return "switched"
+        res = _run(self._tab_cmd("new", "--label", self.tab_label), timeout=self.timeout_s)
+        if not res.ok:
+            raise BrowserError(self._last_line(res))
+        return "created"
+
+    def refocus(self) -> str:
+        """Another target answered instead of our tab: close Chrome's panels, take our tab back."""
+        self.close_panels()
+        return self.focus_own_tab()
+
     # ── actions ─────────────────────────────────────────────────────────────────
     def open(self, url: str) -> None:
         self.ensure_session()
         self._pace()
+        try:
+            self.focus_own_tab()
+        except BrowserError as exc:
+            raise BrowserError(f"could not switch to the plugin's browser tab: {exc}") from None
         # Flags on every navigation: a daemon that died (an operator's `close`, a newer
         # CLI's idle timeout) respawns with our profile instead of a blank one.
         res = _run(self._open_cmd(url), timeout=self.timeout_s)
+        if not res.ok and _BLOCKED_MARKER in (res.stderr + res.stdout):
+            # A target took the active slot between our switch and the navigation (the Gemini
+            # panel reopening). Take the tab back and try exactly once more.
+            self.refocus()
+            res = _run(self._open_cmd(url), timeout=self.timeout_s)
         if not res.ok:
             raise BrowserError(f"could not open {url}: {(res.stderr or res.stdout).strip()}")
 
