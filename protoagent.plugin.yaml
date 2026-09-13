@@ -1,6 +1,6 @@
 id: ebay
 name: Marketplace prices (eBay + Amazon, via browser)
-version: 0.3.2
+version: 0.3.3
 description: >-
   Price research across eBay and Amazon — what an item actually SOLD for on eBay, what it
   is being asked on both, and where today's price sits against what we've recorded before.

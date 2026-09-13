@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote_plus, urlparse
 
 from . import amazon
 from .browser import Browser, BrowserError
@@ -75,7 +75,7 @@ def _is_undecided(data, url: str = "") -> bool:
     """True while the page shows neither results nor a reason — i.e. mid-redirect. A read that
     came from a tab not showing the site we asked for is DECIDED: waiting will not change it,
     the tab has to be taken back, so the settle loop must not spin on it."""
-    if isinstance(data, dict) and _hijacked(data, url):
+    if isinstance(data, dict) and _foreign_host(data, url):
         return False
     return isinstance(data, dict) and not any(
         (data.get("count"), data.get("found_container"), data.get("signin_wall"), data.get("challenge"))
@@ -202,18 +202,55 @@ def _site(host: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
-def _hijacked(data, url: str) -> bool:
-    """The script ran in a tab that is not showing the site we navigated to — the Gemini panel,
-    about:blank, or an operator's tab that took the active slot. Subdomains of the requested
-    site (signin.ebay.com, the /splashui/ challenge pages) are the site. A read without a url
-    (older payloads, test stubs) is not judged."""
+#: The query parameter that carries a search's terms, per marketplace search path.
+_SEARCH_TERM = {"/sch/": "_nkw", "/s": "k"}
+
+
+def _search_term(parsed) -> tuple[str, str] | None:
+    """``(search path, normalized terms)`` for an eBay or Amazon search URL, else ``None``."""
+    for path, key in _SEARCH_TERM.items():
+        if parsed.path == path or (path.endswith("/") and parsed.path.startswith(path)):
+            terms = (parse_qs(parsed.query).get(key) or [""])[0]
+            return path, " ".join(unquote_plus(terms).lower().split())
+    return None
+
+
+def _foreign_host(data, url: str) -> bool:
+    """The read came from a different SITE than the one requested (the Gemini panel, about:blank,
+    an unrelated tab). Only this counts as "decided" for the settle loop: a same-site page that
+    is still loading must still be allowed to settle."""
     if not isinstance(data, dict) or not data.get("url") or not url:
         return False
     want = _site(urlparse(url).hostname or "")
     host = (urlparse(str(data["url"])).hostname or "").lower()
+    return bool(want) and not (host == want or host.endswith("." + want))
+
+
+def _hijacked(data, url: str) -> bool:
+    """The script ran in a tab that is not showing what we navigated to — the Gemini panel,
+    about:blank, an operator's tab that took the active slot. Subdomains of the requested
+    site (signin.ebay.com, the /splashui/ challenge pages) are the site. For a SEARCH, the
+    page must also be our search: an operator's own eBay search, or an item page, answering
+    in its place would otherwise be read as our comps — prices for the wrong query. A read
+    without a url (older payloads, test stubs) is not judged."""
+    if not isinstance(data, dict) or not data.get("url") or not url:
+        return False
+    want_p, got_p = urlparse(url), urlparse(str(data["url"]))
+    want = _site(want_p.hostname or "")
+    host = (got_p.hostname or "").lower()
     if not want:
         return False
-    return not (host == want or host.endswith("." + want))
+    if not (host == want or host.endswith("." + want)):
+        return True
+    wanted = _search_term(want_p)
+    if wanted is None or _site(host) != want:
+        return False  # not a search, or a sign-in / challenge hop on a subdomain: not judged here
+    if got_p.path.startswith(("/itm/", "/dp/", "/gp/product/")):
+        return True  # an item page answered a search
+    got = _search_term(got_p)
+    # Judge only a search page that states its own terms: an operator's search always does,
+    # while an eBay rewrite that drops them is not evidence of another tab.
+    return got is not None and got[1] != "" and got[1] != wanted[1]
 
 
 def _page_meta(data: dict) -> dict:

@@ -29,8 +29,11 @@ every command on the active tab, so navigating "the current tab" could mean navi
 panel (Chrome refuses: ``net::ERR_BLOCKED_BY_CLIENT``) or one of the operator's tabs. So the
 launch step is ``tab <label>`` / ``tab new --label <label>`` carrying the launch flags — the
 flags make the CLI send its full-options launch first, exactly as on ``open`` — and every
-navigation switches to that tab first. Nothing navigates a tab it did not create, and the
-only targets ever closed are Chrome's own panels, never an ordinary page. Verified live on a
+navigation switches to that tab first. The one residual gap is a sub-second race: 0.27.1's
+``open`` cannot name a tab, so a target that appears between the switch and the navigation
+is what gets navigated (the read-side check in tools catches the result). The only targets
+ever closed are Chrome's own panels, and the plugin's own tab when it is wedged — never an
+operator's page. Verified live on a
 throwaway session: the labelled-tab command launched on the requested profile with the
 stealth argument, was reused on repeat, and ``open`` then landed in the labelled tab.
 """
@@ -221,6 +224,15 @@ class Browser:
         if _run(self._tab_cmd(self.tab_label), timeout=self.timeout_s).ok:
             return "switched"
         res = _run(self._tab_cmd("new", "--label", self.tab_label), timeout=self.timeout_s)
+        if not res.ok and "already used" in (res.stderr + res.stdout):
+            # Our tab exists but would not take focus (a hung or crashed tab). Left alone, every
+            # navigation after this fails until someone closes it by hand — so close OUR tab,
+            # the only one carrying this label, and start a fresh one.
+            _run(self._tab_cmd("close", self.tab_label), timeout=self.timeout_s)
+            res = _run(self._tab_cmd("new", "--label", self.tab_label), timeout=self.timeout_s)
+            if res.ok:
+                log.warning("[ebay] the plugin's browser tab would not take focus — replaced it")
+                return "recreated"
         if not res.ok:
             raise BrowserError(self._last_line(res))
         return "created"
