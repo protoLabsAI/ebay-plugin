@@ -819,3 +819,76 @@ class TestReadsFromAnotherTab:
         from ebay_plugin.tools import _hijacked
 
         assert _hijacked({"found_container": True}, _EBAY) is False
+
+
+class TestOwnTabFollowUps:
+    """Review round 2's non-blocking findings, closed."""
+
+    def test_a_wedged_own_tab_is_replaced_not_left_to_block_every_navigation(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(browser_mod.shutil, "which", lambda b: "/usr/bin/agent-browser")
+        calls, state = [], {"closed": False}
+
+        def fake(args, timeout):
+            calls.append(args)
+            sub = args[1:]
+            if sub[:2] == ["tab", "ebaytab"]:
+                return browser_mod.Result(False, "", "✗ Tab t4 is not responding")
+            if sub[:2] == ["tab", "new"]:
+                if state["closed"]:
+                    return browser_mod.Result(True, "✓ Done\n", "")
+                return browser_mod.Result(False, "", "✗ Label `ebaytab` is already used by another tab")
+            if sub[:3] == ["tab", "close", "ebaytab"]:
+                state["closed"] = True
+            return browser_mod.Result(True, "✓ Done\n", "")
+
+        monkeypatch.setattr(browser_mod, "_run", fake)
+        assert Browser(profile=str(tmp_path)).focus_own_tab() == "recreated"
+        closes = [c[1:4] for c in calls if c[1:3] == ["tab", "close"]]
+        assert closes == [["tab", "close", "ebaytab"]]  # only OUR labelled tab, nothing else
+
+    def test_reclaiming_never_closes_an_operator_tab(self, monkeypatch, tmp_path):
+        """Locks in round 1's blocker fix through the real path (refocus from a blocked
+        navigation), not by calling close_panels directly."""
+        tabs = [
+            {"tabId": "t1", "type": "page", "url": "https://mail.google.com/", "active": False},
+            {"tabId": "t2", "type": "page", "url": "https://www.ebay.com/sch/i.html?_nkw=mine", "active": False},
+            {"tabId": "t9", "type": "webview", "url": "https://gemini.google.com/glic", "active": True},
+        ]
+        calls = _tab_cli(monkeypatch, tabs=tabs, open_results=[browser_mod.Result(False, "", _BLOCKED)])
+        Browser(profile=str(tmp_path), min_interval_s=0).open("https://www.ebay.com/sch/i.html?_nkw=x")
+        assert [c[3] for c in calls if c[1:3] == ["tab", "close"]] == ["t9"]
+
+    @pytest.mark.parametrize(
+        "landed,requested,hijacked",
+        [
+            # an operator's own eBay search answering ours: same host, different terms
+            (
+                "https://www.ebay.com/sch/i.html?_nkw=my+own+search&LH_Sold=1",
+                "https://www.ebay.com/sch/i.html?_nkw=kill+team+volkus&LH_Sold=1",
+                True,
+            ),
+            # our search, however eBay re-encodes or reorders it
+            (
+                "https://www.ebay.com/sch/i.html?LH_Sold=1&_nkw=Kill%20Team%20Volkus&rt=nc",
+                "https://www.ebay.com/sch/i.html?_nkw=kill+team+volkus&LH_Sold=1",
+                False,
+            ),
+            # an item page answering a search
+            ("https://www.ebay.com/itm/1234567890", "https://www.ebay.com/sch/i.html?_nkw=x", True),
+            # the sign-in and challenge hops are not judged as a different search
+            ("https://signin.ebay.com/ws/eBayISAPI.dll?SignIn", "https://www.ebay.com/sch/i.html?_nkw=x", False),
+            ("https://www.ebay.com/splashui/captcha?ap=1", "https://www.ebay.com/sch/i.html?_nkw=x", False),
+            # Amazon: k= carries the terms; a product page answering a search
+            ("https://www.amazon.com/s?k=other+thing", "https://www.amazon.com/s?k=hierotek+circle", True),
+            ("https://www.amazon.com/s?k=Hierotek+Circle&ref=nb", "https://www.amazon.com/s?k=hierotek+circle", False),
+            ("https://www.amazon.com/dp/B0ABC", "https://www.amazon.com/s?k=x", True),
+            # not a search request: only the host is judged
+            ("https://www.ebay.com/", "https://www.ebay.com/", False),
+            # a search page that states no terms (an eBay rewrite) is not judged a different search
+            ("https://www.ebay.com/sch/i.html?LH_Sold=1", "https://www.ebay.com/sch/i.html?_nkw=x&LH_Sold=1", False),
+        ],
+    )
+    def test_a_search_must_be_answered_by_our_search(self, landed, requested, hijacked):
+        from ebay_plugin.tools import _hijacked
+
+        assert _hijacked({"url": landed}, requested) is hijacked
