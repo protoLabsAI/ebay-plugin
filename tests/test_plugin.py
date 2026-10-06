@@ -6,7 +6,10 @@ Every test here runs with no protoAgent host and no browser.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import ebay_plugin
 import pytest
@@ -751,9 +754,11 @@ class TestReadsFromAnotherTab:
         """Review finding: the first fix re-read ONCE after repairing, so a re-read that landed
         mid-redirect (eBay's captcha hop) failed as "couldn't find the results list"."""
         import ebay_plugin.tools as tools_mod
+        from ebay_plugin.extract import search_url
 
-        mid_redirect = {"url": _EBAY, "found_container": False, "count": 0}
-        b = _Reads(_PANEL_READ, mid_redirect, dict(_GOOD_PAGE, url=_EBAY))
+        ours = search_url("x", sold=True)  # the read must be OUR search, filters and all
+        mid_redirect = {"url": ours, "found_container": False, "count": 0}
+        b = _Reads(_PANEL_READ, mid_redirect, dict(_GOOD_PAGE, url=ours))
         monkeypatch.setattr(tools_mod, "Browser", lambda **kw: b)
         monkeypatch.setattr(tools_mod, "_SETTLE_S", 0)
         out = json.loads({t.name: t for t in build_tools({})}["ebay_price_check"].invoke({"query": "x"}))
@@ -908,3 +913,155 @@ def test_a_same_site_misfire_still_settles(monkeypatch):
     loading = {"url": "https://www.ebay.com/sch/i.html?_nkw=other", "found_container": False, "count": 0}
     assert tools_mod._is_undecided(loading, _EBAY) is True
     assert tools_mod._is_undecided(_PANEL_READ, _EBAY) is False
+
+
+class TestLimitSizesOnlyTheSample:
+    """`limit` used to truncate the listings BEFORE the statistics: limit=1 reported
+    results_found=1 and a one-row median, though the docs say statistics cover every result."""
+
+    def test_ebay_limit_trims_the_sample_not_the_statistics(self, monkeypatch, tmp_path):
+        import ebay_plugin.tools as tools_mod
+        from ebay_plugin.history import PriceHistory
+
+        monkeypatch.setattr(tools_mod, "Browser", lambda **kw: _StubBrowser(_GOOD_PAGE))
+        db = tmp_path / "h.db"
+        tools = {t.name: t for t in build_tools({"history_db": str(db)})}
+        out = json.loads(tools["ebay_price_check"].invoke({"query": "switch oled", "limit": 1}))
+        assert out["results_found"] == 2 and out["stats"]["count"] == 2
+        assert len(out["sample"]) == 1
+        # the history log records what the statistics were taken over, not the trimmed sample
+        assert PriceHistory(db).summary("switch oled")["observations"] == 2
+
+    def test_ebay_no_limit_is_the_default_sample(self, monkeypatch):
+        rows = [dict(_GOOD_PAGE["rows"][0], url=f"https://www.ebay.com/itm/{i}") for i in range(12)]
+        tools, _ = _tools(monkeypatch, {**_GOOD_PAGE, "rows": rows})
+        out = json.loads(tools["ebay_price_check"].invoke({"query": "switch"}))
+        assert out["results_found"] == 12 and len(out["sample"]) == 8
+
+    def test_amazon_limit_trims_the_sample_not_the_statistics(self, monkeypatch, tmp_path):
+        import ebay_plugin.tools as tools_mod
+        from ebay_plugin.amazon import normalize
+
+        rows, _ = normalize(
+            [{"title": f"t{i}", "url": f"https://www.amazon.com/dp/{i}", "price": f"${10 + i}.00"} for i in range(5)]
+        )
+        monkeypatch.setattr(tools_mod, "Browser", lambda **kw: _StubBrowser(_GOOD_PAGE))
+        monkeypatch.setattr(tools_mod, "_fetch_amazon", lambda *a, **k: (rows, 0))
+        tools = {t.name: t for t in build_tools({"history_db": str(tmp_path / "h.db")})}
+        out = json.loads(tools["amazon_price_check"].invoke({"query": "x", "limit": 1}))
+        assert out["results_found"] == 5 and out["stats"]["count"] == 5
+        assert len(out["sample"]) == 1
+
+
+class TestSecondHijackIsAnError:
+    def test_a_read_still_hijacked_after_the_retry_is_reported_not_priced(self, monkeypatch):
+        """The docstring promised "a second hijack is reported"; the code returned the foreign
+        page's data, which then priced whatever that tab showed."""
+        import ebay_plugin.tools as tools_mod
+
+        other = dict(_GOOD_PAGE, url="https://www.ebay.com/sch/i.html?_nkw=something+else&LH_Sold=1&LH_Complete=1")
+        b = _Reads(other)
+        monkeypatch.setattr(tools_mod, "Browser", lambda **kw: b)
+        out = json.loads({t.name: t for t in build_tools({})}["ebay_price_check"].invoke({"query": "x"}))
+        assert out["ok"] is False and "instead of the requested page" in out["error"]
+        assert b.refocused == 1 and len(b.opened) == 2  # retried exactly once, then reported
+
+    def test_the_probe_still_reports_where_it_landed_rather_than_failing(self, monkeypatch):
+        import ebay_plugin.tools as tools_mod
+
+        b = _Reads(_PANEL_READ)
+        monkeypatch.setattr(tools_mod, "Browser", lambda **kw: b)
+        out = json.loads({t.name: t for t in build_tools({})}["ebay_page_probe"].invoke({"url": _EBAY}))
+        assert out["ok"] is True and out["not_the_requested_site"] is True
+
+
+_SOLD_X = "https://www.ebay.com/sch/i.html?_nkw=x&LH_Sold=1&LH_Complete=1&_sop=12"
+
+
+@pytest.mark.parametrize(
+    "landed,requested,hijacked",
+    [
+        # a concurrent ACTIVE search for the same words answering a SOLD request
+        ("https://www.ebay.com/sch/i.html?_nkw=x&_sop=12", _SOLD_X, True),
+        # and the reverse
+        (_SOLD_X, "https://www.ebay.com/sch/i.html?_nkw=x&_sop=12", True),
+        # same words, another condition
+        (_SOLD_X + "&LH_ItemCondition=4", _SOLD_X + "&LH_ItemCondition=3", True),
+        (_SOLD_X + "&LH_ItemCondition=4", _SOLD_X, True),
+        # same words, another price band
+        (_SOLD_X + "&_udhi=50", _SOLD_X, True),
+        # same filters in another order, extra tracking params: our search
+        ("https://www.ebay.com/sch/i.html?_sop=12&LH_Complete=1&_nkw=X&LH_Sold=1&rt=nc", _SOLD_X, False),
+        # a page that leaves the sort implicit is not judged on sort
+        ("https://www.ebay.com/sch/i.html?_nkw=x&LH_Sold=1&LH_Complete=1", _SOLD_X, False),
+        # but two explicit, different sorts are different searches
+        (_SOLD_X.replace("_sop=12", "_sop=15"), _SOLD_X, True),
+        # Amazon: same words, another price band / sort
+        ("https://www.amazon.com/s?k=x&high-price=20", "https://www.amazon.com/s?k=x", True),
+        ("https://www.amazon.com/s?k=x&s=price-asc-rank", "https://www.amazon.com/s?k=x&s=price-desc-rank", True),
+        ("https://www.amazon.com/s?k=x&ref=nb_sb_noss", "https://www.amazon.com/s?k=x", False),
+    ],
+)
+def test_a_search_must_match_on_its_filters_too(landed, requested, hijacked):
+    from ebay_plugin.tools import _hijacked
+
+    assert _hijacked({"url": landed}, requested) is hijacked
+
+
+class _SharedTab(_StubBrowser):
+    """One tab shared by every caller, like the real labelled tab: a read returns whatever was
+    navigated to LAST, and the navigate → read gap is wide enough for another call to land in it."""
+
+    def __init__(self):
+        super().__init__(None)
+        self.current, self.active, self.max_active = "", 0, 0
+        self._count = threading.Lock()
+
+    def refocus(self):
+        return "switched"
+
+    def open(self, url):
+        with self._count:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        self.current = url
+        time.sleep(0.05)
+
+    def eval_json(self, script):
+        time.sleep(0.05)
+        url = self.current
+        with self._count:
+            self.active -= 1
+        terms = parse_qs(urlparse(url).query)["_nkw"][0]
+        return {
+            "url": url,
+            "found_container": True,
+            "count": 1,
+            "rows": [{"title": terms, "url": "https://www.ebay.com/itm/1", "price": "$10.00", "shipping": ""}],
+        }
+
+
+def test_concurrent_price_checks_never_read_each_others_page(monkeypatch, tmp_path):
+    """Parallel tool calls run on worker threads against ONE tab. Unserialised, call A navigated,
+    call B navigated, and A read B's results — another query's comps reported as A's."""
+    import ebay_plugin.tools as tools_mod
+
+    tab = _SharedTab()
+    monkeypatch.setattr(tools_mod, "Browser", lambda **kw: tab)
+    check = {t.name: t for t in build_tools({"history_db": str(tmp_path / "h.db")})}["ebay_price_check"]
+    queries = [f"item {i}" for i in range(6)]
+    results: dict[str, dict] = {}
+
+    def run(q):
+        results[q] = json.loads(check.invoke({"query": q}))
+
+    threads = [threading.Thread(target=run, args=(q,)) for q in queries]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert tab.max_active == 1  # one navigate → read sequence at a time
+    for q in queries:
+        assert results[q]["ok"] is True, results[q]
+        assert [row["title"] for row in results[q]["sample"]] == [q]
