@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from urllib.parse import parse_qs, unquote_plus, urlparse
 
@@ -123,13 +124,40 @@ def _settle(browser: Browser, script: str, data, url: str):
     return data
 
 
-def _read_page(browser: Browser, url: str, script: str, selector: str | None = None, *, settle: bool = True):
+#: One lock per browser session. Every tool drives the SAME labelled tab, and a read is a
+#: navigate → wait → eval sequence: two tool calls interleaving it (the host runs sync tools on
+#: worker threads, so parallel tool calls really are concurrent) read each other's page — one
+#: query's comps reported as another's. Serialising the sequence is the fix; pacing between
+#: navigations already makes the browser a one-at-a-time resource.
+_SESSION_LOCKS: dict[str, threading.Lock] = {}
+_SESSION_LOCKS_GUARD = threading.Lock()
+
+
+def _session_lock(browser) -> threading.Lock:
+    key = str(getattr(browser, "session", "") or "")
+    with _SESSION_LOCKS_GUARD:
+        return _SESSION_LOCKS.setdefault(key, threading.Lock())
+
+
+def _read_page(
+    browser: Browser,
+    url: str,
+    script: str,
+    selector: str | None = None,
+    *,
+    settle: bool = True,
+    strict: bool = True,
+):
     """Navigate, wait, read and settle — the one read path every tool uses.
 
-    If the read came from a tab that is not showing the site we navigated to (Chrome's Gemini
-    side panel, or an operator's tab that took the active slot), take the plugin's tab back,
-    navigate again and read again through the SAME wait + settle steps. Once: a second
-    hijack is reported, not chased."""
+    The whole sequence holds the session's lock, so concurrent tool calls take turns on the
+    shared tab instead of reading each other's pages.
+
+    If the read came from a tab that is not showing what we navigated to (Chrome's Gemini
+    side panel, an operator's tab that took the active slot, or another search), take the
+    plugin's tab back, navigate again and read again through the SAME wait + settle steps.
+    Once: a second hijack is reported, not chased — ``strict`` (the default) raises it as an
+    error; ``strict=False`` returns the read for a caller that reports it itself."""
 
     def attempt():
         browser.open(url)
@@ -138,12 +166,20 @@ def _read_page(browser: Browser, url: str, script: str, selector: str | None = N
         data = browser.eval_json(script)
         return _settle(browser, script, data, url) if settle else data
 
-    data = attempt()
-    if _hijacked(data, url):
-        browser.refocus()
+    with _session_lock(browser):
         data = attempt()
+        if _hijacked(data, url):
+            browser.refocus()
+            data = attempt()
     if not isinstance(data, dict):
         raise EbayError(f"unexpected response while reading {url}")
+    if strict and _hijacked(data, url):
+        raise EbayError(
+            f"the browser answered from {data.get('url')} instead of the requested page, even after taking "
+            "the plugin's tab back — Chrome's Gemini side panel, another tab, or another search is holding "
+            "the active slot. Reporting that page's listings would price the wrong thing. Close the panel or "
+            "tab in the browser window and retry."
+        )
     return data
 
 
@@ -205,6 +241,17 @@ def _site(host: str) -> str:
 #: The query parameter that carries a search's terms, per marketplace search path.
 _SEARCH_TERM = {"/sch/": "_nkw", "/s": "k"}
 
+#: The filter parameters, per marketplace search path, that change WHICH listings a search
+#: returns (sold vs active, condition, price band, sort). Two searches for the same words with
+#: different filters are different searches: sold comps read off an active-listings page are
+#: asking prices reported as sale prices.
+_SEARCH_FILTERS = {
+    "/sch/": ("LH_Sold", "LH_Complete", "LH_ItemCondition", "_udlo", "_udhi", "_sop"),
+    "/s": ("s", "low-price", "high-price"),
+}
+#: Of those, the ones that only order the results.
+_SORT_KEYS = ("_sop", "s")
+
 
 def _search_term(parsed) -> tuple[str, str] | None:
     """``(search path, normalized terms)`` for an eBay or Amazon search URL, else ``None``."""
@@ -213,6 +260,18 @@ def _search_term(parsed) -> tuple[str, str] | None:
             terms = (parse_qs(parsed.query).get(key) or [""])[0]
             return path, " ".join(unquote_plus(terms).lower().split())
     return None
+
+
+def _search_filters(parsed, path: str) -> dict[str, frozenset[str]]:
+    """The filter parameters a search URL states, each as a set of values (eBay joins several
+    condition ids with ``|``). A parameter that is absent is simply not in the dict."""
+    query = parse_qs(parsed.query)
+    out: dict[str, frozenset[str]] = {}
+    for key in _SEARCH_FILTERS.get(path, ()):
+        values = {v.strip() for raw in query.get(key) or [] for v in unquote_plus(raw).split("|") if v.strip()}
+        if values:
+            out[key] = frozenset(values)
+    return out
 
 
 def _foreign_host(data, url: str) -> bool:
@@ -250,7 +309,20 @@ def _hijacked(data, url: str) -> bool:
     got = _search_term(got_p)
     # Judge only a search page that states its own terms: an operator's search always does,
     # while an eBay rewrite that drops them is not evidence of another tab.
-    return got is not None and got[1] != "" and got[1] != wanted[1]
+    if got is None or got[1] == "":
+        return False
+    if got[1] != wanted[1]:
+        return True
+    # Same words — the filters must match too: a concurrent active-listings search for the
+    # same item, or the same words filtered to another condition, is not our search.
+    got_f, want_f = _search_filters(got_p, wanted[0]), _search_filters(want_p, wanted[0])
+    for key in _SORT_KEYS:
+        # A sort changes the order, not the set: judge it only when both pages state one, so a
+        # page that leaves the default sort implicit is not mistaken for another search.
+        if key not in got_f or key not in want_f:
+            got_f.pop(key, None)
+            want_f.pop(key, None)
+    return got_f != want_f
 
 
 def _page_meta(data: dict) -> dict:
@@ -301,6 +373,16 @@ def _with_meta(payload: dict, meta: dict, found: int) -> dict:
     if notes:
         payload["notes"] = notes
     return payload
+
+
+def _sample_size(limit, max_results: int) -> int:
+    """Rows to list inline: ``limit`` when the caller set one (bounded by ``max_results``),
+    else the default sample. Never applied to the statistics."""
+    try:
+        n = int(limit or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return min(n, max_results) if n > 0 else _SAMPLE
 
 
 def _as_bool(value, default: bool) -> bool:
@@ -354,7 +436,8 @@ def build_tools(cfg: dict):
         asking price as a sale price.
 
         condition: "any", "new" or "used". Statistics cover every result found; only a
-        sample is listed. Prices include stated shipping.
+        sample is listed. limit sets how many listings that sample shows (default 8) and
+        never changes the statistics or results_found. Prices include stated shipping.
         """
         b = _browser()
         try:
@@ -365,10 +448,12 @@ def build_tools(cfg: dict):
         except ValueError as exc:
             return json.dumps({"ok": False, "error": str(exc)})
 
-        cap = limit if limit and limit > 0 else max_results
-        listings = listings[:cap]
+        # `limit` sizes the SAMPLE only. It used to truncate the listings before the
+        # statistics were taken, so limit=1 reported one result and a one-row "median".
+        listings = listings[:max_results]
         _record(query, "ebay", listings)
         stats = summarize(listings)
+        shown = _sample_size(limit, max_results)
         return json.dumps(
             _with_meta(
                 {
@@ -384,7 +469,7 @@ def build_tools(cfg: dict):
                     # comps with the same confidence as sixty.
                     "results_found": len(listings),
                     "unparseable_rows_skipped": dropped,
-                    "sample": [x.as_dict() for x in listings[:_SAMPLE]],
+                    "sample": [x.as_dict() for x in listings[:shown]],
                 },
                 meta,
                 len(listings),
@@ -434,7 +519,7 @@ def build_tools(cfg: dict):
         b = _browser()
         home = f"https://{domain}"
         try:
-            data = _read_page(b, home, SESSION_JS, settle=False)
+            data = _read_page(b, home, SESSION_JS, settle=False, strict=False)
         except (BrowserError, EbayError) as exc:
             return json.dumps({"ok": False, "error": str(exc)})
         if _hijacked(data, home):
@@ -478,7 +563,7 @@ def build_tools(cfg: dict):
         """
         b = _browser()
         try:
-            data = _read_page(b, url, RESULT_JS, settle=False)
+            data = _read_page(b, url, RESULT_JS, settle=False, strict=False)
         except (BrowserError, EbayError) as exc:
             return json.dumps({"ok": False, "error": str(exc)})
         rows = (data or {}).get("rows") or []
@@ -685,6 +770,9 @@ def build_tools(cfg: dict):
         buyers actually paid. Use eBay's sold comps for that. Sponsored placements are flagged
         and excluded from the statistics: an ad is what a seller paid to be shown, not what
         the market charges.
+
+        limit sets how many listings the sample shows (default 8); it never changes the
+        statistics or results_found.
         """
         b = _browser()
         try:
@@ -693,9 +781,9 @@ def build_tools(cfg: dict):
         except (BrowserError, EbayError, ValueError) as exc:
             return json.dumps({"ok": False, "error": str(exc)})
 
-        cap = limit if limit and limit > 0 else max_results
-        listings = listings[:cap]
+        listings = listings[:max_results]  # `limit` sizes the sample only — see ebay_price_check
         _record(query, "amazon", listings)
+        shown = _sample_size(limit, max_results)
         return json.dumps(
             {
                 "ok": True,
@@ -706,7 +794,7 @@ def build_tools(cfg: dict):
                 "stats": summarize(listings),
                 "results_found": len(listings),
                 "unparseable_rows_skipped": dropped,
-                "sample": [x.as_dict() for x in listings[:_SAMPLE]],
+                "sample": [x.as_dict() for x in listings[:shown]],
             }
         )
 
