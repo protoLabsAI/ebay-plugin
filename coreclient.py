@@ -80,7 +80,6 @@ class CoreBrowser:
         nav_timeout_s: float,
         min_interval_s: float,
     ):
-        self.factory = factory
         self.stealth = stealth
         self.session = session  # tools._session_lock keys the read sequence by it
         self.client = factory(

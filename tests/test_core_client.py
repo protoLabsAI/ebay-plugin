@@ -267,6 +267,28 @@ def test_fresh_and_a_different_search_go_to_the_browser(core, tmp_path):
     assert _opens(core) == 4
 
 
+def test_the_cache_keys_on_the_filter_actually_applied_and_the_ebay_site(core, tmp_path):
+    # QA (#8): condition='Used' used to search unfiltered but cache under 'used'; and a repeat on
+    # another eBay domain was answered with the first site's comps.
+    db = str(tmp_path / "h.db")
+    tool = _tool("ebay_price_check", {"history_db": db})
+    tool.invoke({"query": "x", "condition": "Used"})
+    assert json.loads(tool.invoke({"query": "x", "condition": "used"}))["cached"]  # same filter
+    assert "cached" not in json.loads(tool.invoke({"query": "x", "condition": "any"}))
+    uk = _tool("ebay_price_check", {"history_db": db, "domain": "www.ebay.co.uk"})
+    assert "cached" not in json.loads(uk.invoke({"query": "x", "condition": "used"}))
+    assert _opens(core) == 3
+
+
+def test_search_url_honours_condition_in_any_case():
+    from ebay_plugin import extract as from_extract
+
+    assert "LH_ItemCondition=4" in from_extract.search_url("x", condition="Used")
+    assert "LH_ItemCondition" not in from_extract.search_url("x", condition="refurbished")
+    assert from_extract.effective_condition(" NEW ") == "new"
+    assert from_extract.effective_condition("refurbished") == "any"
+
+
 def test_price_and_profit_shares_the_sold_cache(core, tmp_path):
     cfg = {"history_db": str(tmp_path / "h.db")}
     _tool("ebay_price_check", cfg).invoke({"query": "x"})

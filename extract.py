@@ -32,6 +32,13 @@ SORTS = {
 CONDITIONS = {"new": "3", "used": "4", "any": ""}
 
 
+def effective_condition(condition: object) -> str:
+    """The condition filter a search really applies: ``new``/``used`` in any case, else ``any``.
+    The comps cache keys on this too, so it never files unfiltered results under ``used``."""
+    c = str(condition or "").strip().lower()
+    return c if c in CONDITIONS else "any"
+
+
 def search_url(
     query: str,
     *,
@@ -57,7 +64,7 @@ def search_url(
         params["LH_Complete"] = "1"
     if sort_code := SORTS.get(sort):
         params["_sop"] = sort_code
-    if cond := CONDITIONS.get(condition, ""):
+    if cond := CONDITIONS[effective_condition(condition)]:
         params["LH_ItemCondition"] = cond
     if min_price is not None:
         params["_udlo"] = f"{min_price:g}"

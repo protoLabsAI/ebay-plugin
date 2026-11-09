@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, unquote_plus, urlparse
 from . import amazon
 from .browser import Browser, BrowserError, BrowserWall
 from .coreclient import CoreBrowser, core_factory
-from .extract import RESULT_JS, SESSION_JS, Listing, normalize, search_url, summarize
+from .extract import RESULT_JS, SESSION_JS, Listing, effective_condition, normalize, search_url, summarize
 from .fees import Costs, breakeven_price, net_proceeds, schedule_from_config
 
 log = logging.getLogger("protoagent.plugins.ebay")
@@ -520,10 +520,16 @@ def build_tools(cfg: dict):
         ``(listings, dropped, meta, url, cached)``."""
         url = search_url(query, domain=domain, sold=sold, condition=condition)
         basis = "sold" if sold else "active"
+        # Key on what the search really is: the filter search_url applied and the eBay site it
+        # ran on (www.ebay.com and www.ebay.co.uk comps are different markets).
+        cache_source = f"ebay@{str(domain).strip().lower()}"
+        cache_condition = effective_condition(condition)
         h = _history() if cache_ttl_min > 0 else None
         if h is not None and not fresh:
             try:
-                hit = h.recent_check(query, "ebay", basis=basis, condition=condition, max_age_min=cache_ttl_min)
+                hit = h.recent_check(
+                    query, cache_source, basis=basis, condition=cache_condition, max_age_min=cache_ttl_min
+                )
             except Exception:  # noqa: BLE001 — the cache is an optimisation, never a failure
                 log.exception("[ebay] reading the comps cache failed")
                 hit = None
@@ -545,9 +551,9 @@ def build_tools(cfg: dict):
             try:
                 h.record_check(
                     query,
-                    "ebay",
+                    cache_source,
                     basis=basis,
-                    condition=condition,
+                    condition=cache_condition,
                     listings=listings,
                     dropped=dropped,
                     meta=meta,
