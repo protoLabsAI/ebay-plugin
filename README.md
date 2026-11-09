@@ -53,6 +53,8 @@ ebay:
   stealth: false                        # true if your eBay account signs in through Google (below)
   domain: www.ebay.com                  # www.ebay.co.uk, www.ebay.de, …
   amazon_domain: www.amazon.com
+  nav_timeout_s: 35                     # per page load; a hung one is retried once in a fresh tab
+  cache_ttl_min: 360                    # reuse a completed search this long (0 = off)
 ```
 
 Then ask the agent to run `ebay_session_status`, and **sign in once** in the window that
@@ -94,6 +96,33 @@ or passkey login needs none of this.
 | `amazon_price_check` | Amazon asking prices. Sponsored rows are flagged and kept out of the statistics. |
 | `compare_prices` | eBay sold + eBay active + Amazon active, side by side, each labelled with its basis. |
 | `price_history` | Where today's price sits against what we've recorded before. |
+
+**How the browser is driven.** On a protoAgent core whose `agent_browser` plugin offers the
+`agent_browser.client` service, every command goes through core's hardened browser client. That
+client has an output cap, a process-group kill on a timeout, CLI resolution (including core's
+first-use download) and typed results, so a stuck browser reads as a timeout, never as a wall.
+On an older core, or with `agent_browser` off, the plugin uses its own CLI wrapper
+(`browser.py`). Either way it uses the same session, profile, launch options and labelled tab,
+so switching never relaunches Chrome or loses the sign-in. Stealth behaviour is the same on
+both paths.
+
+**Failures say what to do next.** Every error carries an `error_kind`, plus a `next_step` the
+agent follows:
+
+- `timeout`: the browser didn't answer. That is a stuck tab or the site not responding, not
+  a wall. The plugin has already retried once in a fresh tab.
+- `wall`: a sign-in wall or a human check. You act in the browser window.
+- `page`: the page couldn't be read. That is a bug to report, never "nothing found".
+- `unavailable`, `browser` and `bad_input` cover the rest.
+
+Selector waits carry an explicit 10 s timeout. An un-timed wait that never succeeded used to
+cost about 150 s, because the CLI re-sends it five times.
+
+**Repeat searches are cached.** `ebay_price_check` and `ebay_price_and_profit` answer a repeat
+of the same search (query, sold/active, condition) within `cache_ttl_min` from the last
+completed check. The answer says `cached`, with its age. `fresh=true` forces a new reading.
+The cache lives in the same local store as the price history (a `checks` table). A cache hit
+is not counted as a new observation.
 
 A bundled `ebay-pricing` skill teaches the agent how to narrow a query until the comps are
 actually comparable, and how to report a price *with its basis*.
@@ -151,7 +180,7 @@ provided for sales taken *outside* eBay.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 114 tests, no protoAgent host and no browser required
+pytest -q          # 209 tests, no protoAgent host and no browser required
 ruff check . && ruff format --check .
 ```
 

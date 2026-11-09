@@ -70,8 +70,20 @@ market claim.
   by themselves; if it still fails, retry the call once, then stop and report it — it is not an
   eBay problem and not a market finding. (A domain allowlist configured on the browser CLI
   produces the same error; that one is configuration.)
+- **`error_kind: "timeout"`** → the browser didn't answer: a stuck tab or eBay not responding.
+  It is NOT a sign-in wall, NOT a bot check and NOT a market finding. The plugin has already
+  retried once in a fresh tab. Retry the call at most once more; if it times out again, stop and
+  tell the operator the browser looks stuck. Never loop on it.
+- **`error_kind: "wall"`** → a person must act in the browser window (sign in, or clear a
+  check). Say which, and wait for the operator.
 - **couldn't find the results list** → eBay changed its markup. Run `ebay_page_probe` on the
   URL and report what it shows. This is a bug to file, not a market finding.
+
+## Cached answers
+
+A repeat of the same search within a few hours comes back with `cached: {age_minutes, …}` and a
+note. It is the plugin's own earlier check, not a new reading. Repeat that note. Pass
+`fresh=true` when the operator wants today's numbers, or when an earlier answer looked wrong.
 
 ## What this cannot tell you
 

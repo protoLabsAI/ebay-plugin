@@ -32,8 +32,9 @@ import time
 from urllib.parse import parse_qs, unquote_plus, urlparse
 
 from . import amazon
-from .browser import Browser, BrowserError
-from .extract import RESULT_JS, SESSION_JS, normalize, search_url, summarize
+from .browser import Browser, BrowserError, BrowserWall
+from .coreclient import CoreBrowser, core_factory
+from .extract import RESULT_JS, SESSION_JS, Listing, normalize, search_url, summarize
 from .fees import Costs, breakeven_price, net_proceeds, schedule_from_config
 
 log = logging.getLogger("protoagent.plugins.ebay")
@@ -57,7 +58,44 @@ def _default_history_db() -> str:
 
 
 class EbayError(RuntimeError):
-    """An operator-facing failure. Message is safe to show verbatim."""
+    """An operator-facing failure. Message is safe to show verbatim. ``kind`` is ``"wall"``
+    (sign-in wall / human check) or ``"page"`` (the page couldn't be read)."""
+
+    def __init__(self, message: str, kind: str = "page"):
+        super().__init__(message)
+        self.kind = kind
+
+
+#: What to do next, per failure kind — given to the model with every error so it can tell a
+#: stuck browser (retry once, then stop) from a wall (a human must act) from a page it can't
+#: read (a bug to report). The audit behind it: timeouts used to read like any other error, so
+#: the agent retried a stuck browser for minutes, or reported it as a market finding.
+_NEXT_STEP = {
+    "timeout": (
+        "The browser did not respond in time — a stuck browser tab or the site not answering. This is "
+        "NOT a sign-in wall, a bot check or a market finding. The plugin already retried once in a fresh "
+        "tab: retry this call at most once more, and if it times out again stop and tell the operator "
+        "the browser looks stuck."
+    ),
+    "wall": (
+        "A person has to act in the browser window (sign in, or complete the check). Tell the operator; "
+        "don't retry until they say it's done."
+    ),
+    "unavailable": "The browser isn't set up on this machine. Tell the operator; retrying won't help.",
+    "browser": "Retry once; if the same error comes back, report it verbatim — it is not a market finding.",
+    "page": "This is not an empty result. Report it as a read failure, never as 'nothing found'.",
+    "bad_input": "Fix the arguments and call again.",
+}
+
+
+def _failure(exc: Exception) -> dict:
+    """The JSON a tool returns for a failure: the message, a stable ``error_kind`` and the
+    ``next_step`` for that kind."""
+    kind = "bad_input" if isinstance(exc, ValueError) else (getattr(exc, "kind", "") or "browser")
+    out = {"ok": False, "error": str(exc), "error_kind": kind, "next_step": _NEXT_STEP.get(kind, _NEXT_STEP["browser"])}
+    if isinstance(exc, BrowserWall) and exc.wall_kind:
+        out["wall"] = exc.wall_kind
+    return out
 
 
 #: What "the results loaded" looks like — either result layout. Waited for after every
@@ -87,23 +125,45 @@ def _is_undecided(data, url: str = "") -> bool:
 _AMAZON_SELECTOR = 'div[data-component-type="s-search-result"]'
 
 
-def _classify(data, url: str, *, marketplace: str) -> None:
+def _name_generic_wall(browser, url: str, marketplace: str) -> None:
+    """No results and no eBay-specific reason: before calling it a markup change, ask core's
+    generic wall check (Cloudflare, a 403/429, a vendor CAPTCHA) what the page is. Only the core
+    client offers it; the fallback browser skips straight to the markup error."""
+    check = getattr(browser, "check_wall", None)
+    if not callable(check):
+        return
+    try:
+        label = check(url)
+    except Exception:  # noqa: BLE001 — a diagnostic must never replace the real error
+        return
+    if label:
+        raise BrowserWall(
+            f"{marketplace} answered with {label} instead of results. Complete or clear it in the browser "
+            "window, then retry — this plugin hands that to you rather than working around it.",
+            "generic",
+        )
+
+
+def _classify(data, url: str, *, marketplace: str, browser=None) -> None:
     """Raise the right error for a page that carries no results. Shared by both sources
     because both gate the same three ways — sign-in, bot check, or a page we can't read —
     and all three arrive as a card-less DOM."""
     if data.get("signin_wall"):
         raise EbayError(
             f"{marketplace} redirected to its sign-in page. Run the session-status tool, sign in "
-            "once in the browser window, and retry. The profile keeps you signed in after that."
+            "once in the browser window, and retry. The profile keeps you signed in after that.",
+            "wall",
         )
     if data.get("challenge"):
         raise EbayError(
             f"{marketplace} is asking for human verification (a CAPTCHA / bot check) instead of "
             "returning results. Complete it in the browser window, then retry — this plugin "
             "deliberately hands that to you rather than trying to work around it. If it keeps "
-            "recurring, raise min_interval_s to slow the search cadence."
+            "recurring, raise min_interval_s to slow the search cadence.",
+            "wall",
         )
     if not data.get("found_container"):
+        _name_generic_wall(browser, url, marketplace)
         landed = str(data.get("url") or "").strip()
         where = f" The browser ended up at: {landed}" if landed and landed not in url else ""
         raise EbayError(
@@ -172,13 +232,14 @@ def _read_page(
             browser.refocus()
             data = attempt()
     if not isinstance(data, dict):
-        raise EbayError(f"unexpected response while reading {url}")
+        raise EbayError(f"unexpected response while reading {url}", "page")
     if strict and _hijacked(data, url):
         raise EbayError(
             f"the browser answered from {data.get('url')} instead of the requested page, even after taking "
             "the plugin's tab back — Chrome's Gemini side panel, another tab, or another search is holding "
             "the active slot. Reporting that page's listings would price the wrong thing. Close the panel or "
-            "tab in the browser window and retry."
+            "tab in the browser window and retry.",
+            "browser",
         )
     return data
 
@@ -190,7 +251,7 @@ def _read(browser: Browser, url: str, script: str, selector: str):
 
 def _fetch_amazon(browser: Browser, url: str):
     data = _read(browser, url, amazon.RESULT_JS, _AMAZON_SELECTOR)
-    _classify(data, url, marketplace="Amazon")
+    _classify(data, url, marketplace="Amazon", browser=browser)
     return amazon.normalize(data.get("rows") or [])
 
 
@@ -208,16 +269,19 @@ def _fetch(browser: Browser, url: str, *, sold: bool):
         raise EbayError(
             "eBay redirected to its sign-in page. The sold-listings view needs a signed-in "
             "session — run ebay_session_status, sign in once in the browser window, and retry. "
-            "The profile keeps you signed in after that."
+            "The profile keeps you signed in after that.",
+            "wall",
         )
     if data.get("challenge"):
         raise EbayError(
             "eBay is asking for human verification (its 'Security Measure' / CAPTCHA page) "
             "instead of returning results. Complete it in the browser window, then retry — "
             "this plugin deliberately hands that to you rather than trying to work around it. "
-            "If it keeps recurring, raise ebay.min_interval_s to slow the search cadence."
+            "If it keeps recurring, raise ebay.min_interval_s to slow the search cadence.",
+            "wall",
         )
     if not data.get("found_container"):
+        _name_generic_wall(browser, url, "eBay")
         # Name where the browser actually ENDED UP. Without it this error is unfalsifiable —
         # "the markup changed" reads the same whether eBay redesigned the page or simply
         # bounced you somewhere else, and only one of those is a bug to file.
@@ -364,6 +428,14 @@ def _page_notes(meta: dict, found: int) -> list[str]:
     return notes
 
 
+def _with_cached(cached: dict | None, payload: dict) -> dict:
+    """Mark an answer served from the comps cache, and say so in ``notes`` the model repeats."""
+    if cached:
+        payload["cached"] = cached
+        payload.setdefault("notes", []).append(f"These comps are {cached['note']}.")
+    return payload
+
+
 def _with_meta(payload: dict, meta: dict, found: int) -> dict:
     payload["headline_count"] = meta.get("headline_count")
     payload["related_rows_excluded"] = meta.get("related_rows_excluded", 0)
@@ -405,21 +477,85 @@ def build_tools(cfg: dict):
     # THIS PLUGIN had just started and tripped the "someone else owns the browser" guard on
     # itself — the first search worked and every one after it failed. Sharing the instance
     # also keeps the pacing clock honest across calls, which a per-call object silently reset.
-    shared = Browser(
-        binary=cfg.get("binary") or "agent-browser",
-        session=cfg.get("session") or "ebay",
-        profile=cfg.get("profile") or "",
-        headed=_as_bool(cfg.get("headed"), True),
-        stealth=_as_bool(cfg.get("stealth"), False),
-        timeout_s=float(cfg.get("timeout_s", 60)),
-        min_interval_s=float(cfg.get("min_interval_s", 1.5)),
-    )
+    opts = {
+        "session": cfg.get("session") or "ebay",
+        "profile": cfg.get("profile") or "",
+        "headed": _as_bool(cfg.get("headed"), True),
+        "stealth": _as_bool(cfg.get("stealth"), False),
+        "timeout_s": float(cfg.get("timeout_s", 60)),
+        "nav_timeout_s": float(cfg.get("nav_timeout_s", 35)),
+        "min_interval_s": float(cfg.get("min_interval_s", 1.5)),
+    }
+    shared = Browser(binary=cfg.get("binary") or "agent-browser", **opts)
+    # The core-client path, built once per factory: the pacing clock lives on it, and a plugin
+    # reload hands out a NEW factory (with core's new lock table), which must not keep the old one.
+    core: dict = {"factory": None, "browser": None}
 
-    def _browser() -> Browser:
-        return shared
+    def _browser():
+        """Core's hardened browser client when the host offers it (``agent_browser.client``),
+        else this plugin's own CLI wrapper — looked up per call (coreclient module doc)."""
+        factory = core_factory()
+        if factory is None:
+            return shared
+        if core["factory"] is not factory:
+            try:
+                core["browser"] = CoreBrowser(factory, **opts)
+                core["factory"] = factory
+            except Exception:  # noqa: BLE001 — a client that won't build must not take the tools down
+                log.exception("[ebay] the core browser client could not be built; using the plugin's own")
+                return shared
+            log.info("[ebay] driving the browser through core's agent_browser.client")
+        return core["browser"]
 
     domain = cfg.get("domain") or "www.ebay.com"
     max_results = int(cfg.get("max_results", 60))
+    # A repeat of the same search inside this window is answered from the plugin's own record of
+    # the last check instead of the browser (0 = off). Sold comps move over days, not minutes, and
+    # every browser trip costs seconds and an eBay page view.
+    cache_ttl_min = float(cfg.get("cache_ttl_min", 360) or 0)
+
+    def _comps(query: str, *, sold: bool, condition: str, fresh: bool):
+        """eBay comps for a search — from a recent check of the exact same search when there is
+        one (``cached`` says so), else from the browser (and remembered). Returns
+        ``(listings, dropped, meta, url, cached)``."""
+        url = search_url(query, domain=domain, sold=sold, condition=condition)
+        basis = "sold" if sold else "active"
+        h = _history() if cache_ttl_min > 0 else None
+        if h is not None and not fresh:
+            try:
+                hit = h.recent_check(query, "ebay", basis=basis, condition=condition, max_age_min=cache_ttl_min)
+            except Exception:  # noqa: BLE001 — the cache is an optimisation, never a failure
+                log.exception("[ebay] reading the comps cache failed")
+                hit = None
+            if hit is not None:
+                try:
+                    listings = [Listing(**row) for row in hit.get("listings") or []]
+                except TypeError:  # a row from a different Listing shape — read it fresh instead
+                    listings = None
+                if listings is not None:
+                    cached = {
+                        "checked_at": hit["seen_at"],
+                        "age_minutes": hit["age_min"],
+                        "note": f"from this plugin's own check {hit['age_min']} min ago (no browser trip); "
+                        "pass fresh=true for a new reading",
+                    }
+                    return listings, int(hit.get("dropped") or 0), hit.get("meta") or {}, url, cached
+        listings, dropped, meta = _fetch(_browser(), url, sold=sold)
+        if h is not None:
+            try:
+                h.record_check(
+                    query,
+                    "ebay",
+                    basis=basis,
+                    condition=condition,
+                    listings=listings,
+                    dropped=dropped,
+                    meta=meta,
+                    url=url,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("[ebay] recording the comps cache failed")
+        return listings, dropped, meta, url, None
 
     @tool
     def ebay_price_check(
@@ -427,6 +563,7 @@ def build_tools(cfg: dict):
         condition: str = "any",
         sold: bool = True,
         limit: int = 0,
+        fresh: bool = False,
     ) -> str:
         """What does this item actually go for on eBay? Returns median/quartile price statistics plus a sample of matching listings.
 
@@ -437,42 +574,44 @@ def build_tools(cfg: dict):
 
         condition: "any", "new" or "used". Statistics cover every result found; only a
         sample is listed. limit sets how many listings that sample shows (default 8) and
-        never changes the statistics or results_found. Prices include stated shipping.
+        never changes the statistics or results_found. Prices include stated shipping. A repeat
+        of the same search within a few hours answers from the last check (`cached` says so);
+        fresh=True forces a new one.
         """
-        b = _browser()
         try:
-            url = search_url(query, domain=domain, sold=sold, condition=condition)
-            listings, dropped, meta = _fetch(b, url, sold=sold)
-        except (BrowserError, EbayError) as exc:
-            return json.dumps({"ok": False, "error": str(exc)})
-        except ValueError as exc:
-            return json.dumps({"ok": False, "error": str(exc)})
+            listings, dropped, meta, url, cached = _comps(query, sold=sold, condition=condition, fresh=fresh)
+        except (BrowserError, EbayError, ValueError) as exc:
+            return json.dumps(_failure(exc))
 
         # `limit` sizes the SAMPLE only. It used to truncate the listings before the
         # statistics were taken, so limit=1 reported one result and a one-row "median".
         listings = listings[:max_results]
-        _record(query, "ebay", listings)
+        if cached is None:
+            _record(query, "ebay", listings)  # a cache hit is not a new observation
         stats = summarize(listings)
         shown = _sample_size(limit, max_results)
         return json.dumps(
-            _with_meta(
-                {
-                    "ok": True,
-                    "query": query,
-                    "basis": "sold listings — what buyers paid"
-                    if sold
-                    else "active listings — asking prices, NOT sale prices",
-                    "condition": condition,
-                    "url": url,
-                    "stats": stats,
-                    # Surfaced so the model can qualify a thin result instead of treating three
-                    # comps with the same confidence as sixty.
-                    "results_found": len(listings),
-                    "unparseable_rows_skipped": dropped,
-                    "sample": [x.as_dict() for x in listings[:shown]],
-                },
-                meta,
-                len(listings),
+            _with_cached(
+                cached,
+                _with_meta(
+                    {
+                        "ok": True,
+                        "query": query,
+                        "basis": "sold listings — what buyers paid"
+                        if sold
+                        else "active listings — asking prices, NOT sale prices",
+                        "condition": condition,
+                        "url": url,
+                        "stats": stats,
+                        # Surfaced so the model can qualify a thin result instead of treating three
+                        # comps with the same confidence as sixty.
+                        "results_found": len(listings),
+                        "unparseable_rows_skipped": dropped,
+                        "sample": [x.as_dict() for x in listings[:shown]],
+                    },
+                    meta,
+                    len(listings),
+                ),
             )
         )
 
@@ -491,7 +630,7 @@ def build_tools(cfg: dict):
             url = search_url(query, domain=domain, sold=sold, sort=sort, condition=condition)
             listings, dropped, meta = _fetch(b, url, sold=sold)
         except (BrowserError, EbayError, ValueError) as exc:
-            return json.dumps({"ok": False, "error": str(exc)})
+            return json.dumps(_failure(exc))
         return json.dumps(
             _with_meta(
                 {
@@ -521,7 +660,7 @@ def build_tools(cfg: dict):
         try:
             data = _read_page(b, home, SESSION_JS, settle=False, strict=False)
         except (BrowserError, EbayError) as exc:
-            return json.dumps({"ok": False, "error": str(exc)})
+            return json.dumps(_failure(exc))
         if _hijacked(data, home):
             # Another tab answered twice. Saying "not signed in" here would send the operator to
             # sign in again for nothing — say what actually happened instead.
@@ -565,7 +704,7 @@ def build_tools(cfg: dict):
         try:
             data = _read_page(b, url, RESULT_JS, settle=False, strict=False)
         except (BrowserError, EbayError) as exc:
-            return json.dumps({"ok": False, "error": str(exc)})
+            return json.dumps(_failure(exc))
         rows = (data or {}).get("rows") or []
         return json.dumps(
             {
@@ -627,7 +766,7 @@ def build_tools(cfg: dict):
                 costs=_costs(item_cost, shipping_cost, other_costs, labor_hours, hourly_rate),
             )
         except ValueError as exc:
-            return json.dumps({"ok": False, "error": str(exc)})
+            return json.dumps(_failure(exc))
         return json.dumps({"ok": True, **result})
 
     @tool
@@ -658,7 +797,7 @@ def build_tools(cfg: dict):
                 promoted=bool(promoted),
             )
         except ValueError as exc:
-            return json.dumps({"ok": False, "error": str(exc)})
+            return json.dumps(_failure(exc))
         return json.dumps(
             {
                 "ok": True,
@@ -680,6 +819,7 @@ def build_tools(cfg: dict):
         condition: str = "any",
         labor_hours: float = 0.0,
         hourly_rate: float = 0.0,
+        fresh: bool = False,
     ) -> str:
         """Price an item against real sold comps AND show what you'd net at those prices. The one-call answer to "what should I list this at?".
 
@@ -687,21 +827,27 @@ def build_tools(cfg: dict):
         through eBay's fees and your costs, so the answer is net profit at each price rather
         than a headline number that fees quietly eat.
         """
-        b = _browser()
         try:
-            url = search_url(query, domain=domain, sold=True, condition=condition)
-            listings, dropped, meta = _fetch(b, url, sold=True)
+            listings, dropped, meta, url, cached = _comps(query, sold=True, condition=condition, fresh=fresh)
         except (BrowserError, EbayError, ValueError) as exc:
-            return json.dumps({"ok": False, "error": str(exc)})
+            return json.dumps(_failure(exc))
 
         listings = listings[:max_results]
         stats = summarize(listings)
         if not stats.get("count"):
             return json.dumps(
-                _with_meta(
-                    {"ok": True, "query": query, "stats": stats, "note": "no sold comps found — try a broader query"},
-                    meta,
-                    0,
+                _with_cached(
+                    cached,
+                    _with_meta(
+                        {
+                            "ok": True,
+                            "query": query,
+                            "stats": stats,
+                            "note": "no sold comps found — try a broader query",
+                        },
+                        meta,
+                        0,
+                    ),
                 )
             )
 
@@ -720,25 +866,28 @@ def build_tools(cfg: dict):
             }
 
         return json.dumps(
-            _with_meta(
-                {
-                    "ok": True,
-                    "query": query,
-                    "basis": "sold listings — what buyers paid",
-                    "url": url,
-                    "stats": stats,
-                    "results_found": len(listings),
-                    "unparseable_rows_skipped": dropped,
-                    "breakeven_price": breakeven_price(schedule=schedule, costs=costs),
-                    "at_market_prices": scenarios,
-                    "your_costs": costs.total,
-                    "schedule": schedule.as_dict(),
-                    "caveat": ""
-                    if schedule.verified
-                    else "Fee schedule is UNVERIFIED — confirm against a real eBay invoice.",
-                },
-                meta,
-                len(listings),
+            _with_cached(
+                cached,
+                _with_meta(
+                    {
+                        "ok": True,
+                        "query": query,
+                        "basis": "sold listings — what buyers paid",
+                        "url": url,
+                        "stats": stats,
+                        "results_found": len(listings),
+                        "unparseable_rows_skipped": dropped,
+                        "breakeven_price": breakeven_price(schedule=schedule, costs=costs),
+                        "at_market_prices": scenarios,
+                        "your_costs": costs.total,
+                        "schedule": schedule.as_dict(),
+                        "caveat": ""
+                        if schedule.verified
+                        else "Fee schedule is UNVERIFIED — confirm against a real eBay invoice.",
+                    },
+                    meta,
+                    len(listings),
+                ),
             )
         )
 
@@ -779,7 +928,7 @@ def build_tools(cfg: dict):
             url = amazon.search_url(query, domain=amazon_domain, sort=sort)
             listings, dropped = _fetch_amazon(b, url)
         except (BrowserError, EbayError, ValueError) as exc:
-            return json.dumps({"ok": False, "error": str(exc)})
+            return json.dumps(_failure(exc))
 
         listings = listings[:max_results]  # `limit` sizes the sample only — see ebay_price_check
         _record(query, "amazon", listings)
@@ -887,7 +1036,7 @@ def build_tools(cfg: dict):
             except (BrowserError, EbayError, ValueError) as exc:
                 # Named, not omitted: a missing source that looks like an absent one turns a
                 # half-answer into a confident whole one.
-                out["sources"][key] = {"ok": False, "error": str(exc), "basis": basis}
+                out["sources"][key] = {**_failure(exc), "basis": basis}
 
         _run(
             "ebay_sold",

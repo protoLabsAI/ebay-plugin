@@ -21,6 +21,7 @@ otherwise.
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from contextlib import closing
@@ -38,6 +39,20 @@ CREATE TABLE IF NOT EXISTS observations (
     seen_at   TEXT NOT NULL       -- ISO-8601 UTC
 );
 CREATE INDEX IF NOT EXISTS idx_obs_key ON observations(key, seen_at);
+-- One row per completed search: what the tool read, so a repeat of the same search inside
+-- the cache window is answered from here instead of the browser. Separate from
+-- `observations` (which carries no sold/active basis or condition, and must not be
+-- double-counted by a cache hit).
+CREATE TABLE IF NOT EXISTS checks (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    key       TEXT NOT NULL,      -- normalized query
+    source    TEXT NOT NULL,      -- ebay | amazon
+    basis     TEXT NOT NULL,      -- sold | active
+    condition TEXT NOT NULL,      -- any | new | used
+    seen_at   TEXT NOT NULL,      -- ISO-8601 UTC
+    payload   TEXT NOT NULL       -- JSON: listings, dropped, meta, url
+);
+CREATE INDEX IF NOT EXISTS idx_checks_key ON checks(key, source, basis, condition, seen_at);
 """
 
 
@@ -89,6 +104,67 @@ class PriceHistory:
             )
             db.commit()
         return len(rows)
+
+    def record_check(
+        self,
+        key: str,
+        source: str,
+        *,
+        basis: str,
+        condition: str,
+        listings,
+        dropped: int,
+        meta: dict,
+        url: str,
+        now: str | None = None,
+    ) -> None:
+        """Remember one completed search in full, for :meth:`recent_check`. Every listing is
+        kept (sponsored rows too) so a cached answer is computed exactly as a live one."""
+        payload = {
+            "listings": [x.as_dict() for x in listings],
+            "dropped": int(dropped or 0),
+            "meta": dict(meta or {}),
+            "url": url,
+        }
+        with closing(self._connect()) as db:
+            db.execute(
+                "INSERT INTO checks (key, source, basis, condition, seen_at, payload) VALUES (?,?,?,?,?,?)",
+                (
+                    normalize_key(key),
+                    source,
+                    basis,
+                    (condition or "any").lower(),
+                    now or datetime.now(UTC).isoformat(),
+                    json.dumps(payload),
+                ),
+            )
+            db.commit()
+
+    def recent_check(
+        self, key: str, source: str, *, basis: str, condition: str, max_age_min: float, now: datetime | None = None
+    ) -> dict | None:
+        """The newest :meth:`record_check` for this exact search within ``max_age_min``, or
+        ``None``. Returns the stored payload plus ``seen_at`` and ``age_min``."""
+        if not max_age_min or max_age_min <= 0:
+            return None
+        now = now or datetime.now(UTC)
+        since = (now - timedelta(minutes=max_age_min)).isoformat()
+        with closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT seen_at, payload FROM checks WHERE key = ? AND source = ? AND basis = ? AND condition = ? "
+                "AND seen_at >= ? ORDER BY seen_at DESC LIMIT 1",
+                (normalize_key(key), source, basis, (condition or "any").lower(), since),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["payload"])
+        except ValueError:
+            return None
+        seen = datetime.fromisoformat(row["seen_at"])
+        payload["seen_at"] = row["seen_at"]
+        payload["age_min"] = max(0, int((now - seen).total_seconds() // 60))
+        return payload
 
     def summary(self, key: str, *, days: int = 90, source: str = "") -> dict:
         """Where the record sits over the last ``days``.
