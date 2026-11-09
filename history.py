@@ -46,7 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_obs_key ON observations(key, seen_at);
 CREATE TABLE IF NOT EXISTS checks (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     key       TEXT NOT NULL,      -- normalized query
-    source    TEXT NOT NULL,      -- ebay | amazon
+    source    TEXT NOT NULL,      -- ebay@<domain> (the eBay site searched) | amazon
     basis     TEXT NOT NULL,      -- sold | active
     condition TEXT NOT NULL,      -- any | new | used
     seen_at   TEXT NOT NULL,      -- ISO-8601 UTC

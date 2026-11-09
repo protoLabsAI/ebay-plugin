@@ -378,3 +378,12 @@ def test_a_second_fallback_timeout_is_typed(monkeypatch):
     with pytest.raises(BrowserTimeout) as exc:
         b.open("https://www.ebay.com/")
     assert exc.value.kind == "timeout" and "twice" in str(exc.value)
+
+
+def test_quartiles_use_one_nearest_rank_rule():
+    # QA (#8): p75 used int(n*0.75), which returned the max whenever 4 divided n.
+    from ebay_plugin.extract import Listing, summarize
+
+    rows = [Listing("t", "u", float(p), None, "$", 0.0, "", "", True) for p in (10, 20, 30, 40)]
+    stats = summarize(rows)
+    assert (stats["p25"], stats["p75"], stats["high"]) == (10, 30, 40)
