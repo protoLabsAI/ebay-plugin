@@ -43,6 +43,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import shutil
 import subprocess
 import time
@@ -66,7 +67,30 @@ _STEALTH_ARGS = "--disable-blink-features=AutomationControlled"
 
 
 class BrowserError(RuntimeError):
-    """A browser command failed, or the CLI isn't usable. Message is operator-facing."""
+    """A browser command failed, or the CLI isn't usable. Message is operator-facing.
+
+    ``kind`` says which failure it is, so a tool can tell the model what to do next instead of
+    handing it one undifferentiated string: ``"timeout"`` (the browser didn't answer — a stuck
+    tab or a site not responding, NOT a wall), ``"wall"`` (a bot check / sign-in wall answered),
+    ``"unavailable"`` (no usable CLI), or ``"browser"`` (anything else the CLI reported)."""
+
+    kind = "browser"
+
+
+class BrowserTimeout(BrowserError):
+    kind = "timeout"
+
+
+class BrowserWall(BrowserError):
+    kind = "wall"
+
+    def __init__(self, message: str, wall_kind: str = ""):
+        super().__init__(message)
+        self.wall_kind = wall_kind
+
+
+class BrowserUnavailable(BrowserError):
+    kind = "unavailable"
 
 
 @dataclass
@@ -76,15 +100,31 @@ class Result:
     stderr: str
 
 
-def _run(args: list[str], *, timeout: float) -> Result:
-    """Run the CLI once. The single seam every test stubs."""
+#: The CLI gives up reading a reply after 30 s and RE-SENDS the command, up to five times
+#: (agent-browser 0.27.1 ``connection.rs``). The daemon's default wait is also 30 s, so a wait
+#: that never succeeds (a gate page with no results) cost ~150 s — measured: 152 s for one
+#: un-timed ``wait``. Every wait here carries its own timeout, well under that.
+_WAIT_TIMEOUT_S = 10.0
+_TIMED_OUT = "timed out after"
+
+
+def _run(args: list[str], *, timeout: float, env: dict | None = None) -> Result:
+    """Run the CLI once. The single seam every test stubs. ``env`` is merged over this
+    process's environment for this one call (a wait's ``AGENT_BROWSER_DEFAULT_TIMEOUT``)."""
     try:
-        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)  # noqa: S603
+        p = subprocess.run(  # noqa: S603
+            args, capture_output=True, text=True, timeout=timeout, env={**os.environ, **env} if env else None
+        )
     except subprocess.TimeoutExpired:
-        return Result(False, "", f"timed out after {timeout:.0f}s")
+        return Result(False, "", f"{_TIMED_OUT} {timeout:.0f}s")
     except FileNotFoundError:
         return Result(False, "", f"{args[0]!r} not found on PATH")
     return Result(p.returncode == 0, p.stdout or "", p.stderr or "")
+
+
+def _timed_out(res: Result) -> bool:
+    text = (res.stderr or "") + (res.stdout or "")
+    return _TIMED_OUT in text or "daemon may be busy or unresponsive" in text
 
 
 class Browser:
@@ -106,6 +146,7 @@ class Browser:
         stealth: bool = False,
         timeout_s: float = 60.0,
         min_interval_s: float = 1.5,
+        nav_timeout_s: float = 35.0,
     ):
         self.binary = binary
         self.session = session
@@ -114,6 +155,10 @@ class Browser:
         self.stealth = stealth
         self.timeout_s = timeout_s
         self.min_interval_s = min_interval_s
+        # Shorter than the per-command timeout, and just past the CLI's 30 s read timeout: a
+        # navigation the daemon never answers (a wedged tab) is re-sent by the CLI up to five
+        # times, so waiting the full per-command timeout only buys more re-sends.
+        self.nav_timeout_s = min(nav_timeout_s, timeout_s)
         self._last_nav = 0.0
         self._session_ready = False
         self.tab_label = _TAB_LABEL
@@ -163,11 +208,11 @@ class Browser:
         if self._session_ready:
             return
         if reason := self.available():
-            raise BrowserError(reason)
+            raise BrowserUnavailable(reason)
         try:
             self.focus_own_tab()
         except BrowserError as exc:
-            raise BrowserError(f"could not start the browser: {exc}") from None
+            raise type(exc)(f"could not start the browser: {exc}") from None
         self._session_ready = True
 
     def close(self) -> None:
@@ -234,8 +279,15 @@ class Browser:
                 log.warning("[ebay] the plugin's browser tab would not take focus — replaced it")
                 return "recreated"
         if not res.ok:
-            raise BrowserError(self._last_line(res))
+            raise (BrowserTimeout if _timed_out(res) else BrowserError)(self._last_line(res))
         return "created"
+
+    def reset_tab(self) -> None:
+        """After a navigation that timed out: close Chrome's panels and replace OUR tab (the
+        only one carrying our label) with a fresh one. Never touches another tab."""
+        self.close_panels()
+        _run(self._tab_cmd("close", self.tab_label), timeout=self.timeout_s)
+        _run(self._tab_cmd("new", "--label", self.tab_label), timeout=self.timeout_s)
 
     def refocus(self) -> str:
         """Another target answered instead of our tab: close Chrome's panels, take our tab back."""
@@ -249,17 +301,30 @@ class Browser:
         try:
             self.focus_own_tab()
         except BrowserError as exc:
-            raise BrowserError(f"could not switch to the plugin's browser tab: {exc}") from None
+            raise type(exc)(f"could not switch to the plugin's browser tab: {exc}") from None
         # Flags on every navigation: a daemon that died (an operator's `close`, a newer
         # CLI's idle timeout) respawns with our profile instead of a blank one.
-        res = _run(self._open_cmd(url), timeout=self.timeout_s)
+        res = _run(self._open_cmd(url), timeout=self.nav_timeout_s)
         if not res.ok and _BLOCKED_MARKER in (res.stderr + res.stdout):
             # A target took the active slot between our switch and the navigation (the Gemini
             # panel reopening). Take the tab back and try exactly once more.
             self.refocus()
-            res = _run(self._open_cmd(url), timeout=self.timeout_s)
+            res = _run(self._open_cmd(url), timeout=self.nav_timeout_s)
+        if not res.ok and _timed_out(res):
+            # The one automatic recovery: a hung navigation usually means a wedged tab, so
+            # replace our tab and try once more before reporting a typed timeout.
+            log.warning("[ebay] opening %s timed out — replacing the plugin's tab and retrying once", url)
+            self.reset_tab()
+            with contextlib.suppress(BrowserError):
+                self.focus_own_tab()
+            res = _run(self._open_cmd(url), timeout=self.nav_timeout_s)
+            if not res.ok and _timed_out(res):
+                raise BrowserTimeout(
+                    f"{url} did not load within {self.nav_timeout_s:.0f}s, twice (the second time in a fresh tab)"
+                )
         if not res.ok:
-            raise BrowserError(f"could not open {url}: {(res.stderr or res.stdout).strip()}")
+            cls = BrowserTimeout if _timed_out(res) else BrowserError
+            raise cls(f"could not open {url}: {(res.stderr or res.stdout).strip()}")
 
     def wait_for(self, selector: str, *, timeout_s: float | None = None) -> bool:
         """Block until ``selector`` appears. ``True`` if it did.
@@ -272,7 +337,15 @@ class Browser:
         and decides what it's looking at.
         """
         self.ensure_session()
-        res = _run(self._cmd("wait", selector), timeout=timeout_s or self.timeout_s)
+        secs = min(timeout_s or _WAIT_TIMEOUT_S, 25.0)
+        # The CLI takes a selector wait's timeout from AGENT_BROWSER_DEFAULT_TIMEOUT (it injects it
+        # into the command). Without it the daemon waits 30 s — exactly the CLI's read timeout — and
+        # the CLI re-sends the wait up to five times (see _WAIT_TIMEOUT_S).
+        res = _run(
+            self._cmd("wait", selector),
+            timeout=secs + 10.0,
+            env={"AGENT_BROWSER_DEFAULT_TIMEOUT": str(int(secs * 1000))},
+        )
         return res.ok
 
     def eval_json(self, script: str):
@@ -291,9 +364,9 @@ class Browser:
                 args, input=script, capture_output=True, text=True, timeout=self.timeout_s
             )
         except subprocess.TimeoutExpired:
-            raise BrowserError(f"page script timed out after {self.timeout_s:.0f}s") from None
+            raise BrowserTimeout(f"page script timed out after {self.timeout_s:.0f}s") from None
         except FileNotFoundError:
-            raise BrowserError(f"{self.binary!r} not found on PATH") from None
+            raise BrowserUnavailable(f"{self.binary!r} not found on PATH") from None
         if p.returncode != 0:
             raise BrowserError(f"page script failed: {(p.stderr or p.stdout).strip()}")
         return _parse_cli_json(p.stdout)

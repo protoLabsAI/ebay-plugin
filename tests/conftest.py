@@ -38,3 +38,14 @@ class FakeRegistry:
 @pytest.fixture
 def registry():
     return FakeRegistry()
+
+
+@pytest.fixture(autouse=True)
+def _private_history_db(tmp_path, monkeypatch):
+    """Every test gets its own price-history / comps-cache file. Host-free, the default path is
+    ``~/.protoagent/marketplace-prices.db``, so the suite used to write its fixture rows ("x",
+    "switch oled") into the operator's real home directory, and with the comps cache one test's
+    search would answer the next one's."""
+    import ebay_plugin.tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "_default_history_db", lambda: str(tmp_path / "prices.db"))

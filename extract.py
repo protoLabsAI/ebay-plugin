@@ -32,6 +32,13 @@ SORTS = {
 CONDITIONS = {"new": "3", "used": "4", "any": ""}
 
 
+def effective_condition(condition: object) -> str:
+    """The condition filter a search really applies: ``new``/``used`` in any case, else ``any``.
+    The comps cache keys on this too, so it never files unfiltered results under ``used``."""
+    c = str(condition or "").strip().lower()
+    return c if c in CONDITIONS else "any"
+
+
 def search_url(
     query: str,
     *,
@@ -57,7 +64,7 @@ def search_url(
         params["LH_Complete"] = "1"
     if sort_code := SORTS.get(sort):
         params["_sop"] = sort_code
-    if cond := CONDITIONS.get(condition, ""):
+    if cond := CONDITIONS[effective_condition(condition)]:
         params["LH_ItemCondition"] = cond
     if min_price is not None:
         params["_udlo"] = f"{min_price:g}"
@@ -228,8 +235,10 @@ def summarize(listings: list[Listing]) -> dict:
         "low": round(totals[0], 2),
         "high": round(totals[-1], 2),
         # Quartiles bound "what it usually goes for" without the tails.
-        "p25": round(totals[max(0, int(n * 0.25) - (1 if n % 4 == 0 else 0))], 2),
-        "p75": round(totals[min(n - 1, int(n * 0.75))], 2),
+        # Nearest-rank quartiles (index ceil(q*n) - 1), the same rule for both: [10,20,30,40]
+        # gives p25 10 and p75 30. p75 used int(n*0.75), which returned the max when 4 | n.
+        "p25": round(totals[max(0, -(-n // 4) - 1)], 2),
+        "p75": round(totals[max(0, -(-3 * n // 4) - 1)], 2),
         "basis": "item price + shipping, where shipping was stated",
     }
     if excluded:

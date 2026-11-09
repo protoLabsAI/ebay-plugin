@@ -1,6 +1,6 @@
 id: ebay
 name: Marketplace prices (eBay + Amazon, via browser)
-version: 0.3.3
+version: 0.4.0
 description: >-
   Price research across eBay and Amazon — what an item actually SOLD for on eBay, what it
   is being asked on both, and where today's price sits against what we've recorded before.
@@ -15,7 +15,11 @@ description: >-
   you signed in. No API keys, and this plugin never handles your credentials.
 
   Requires the `agent-browser` binary on PATH (`npm i -g agent-browser && agent-browser
-  install`). Ships DISABLED; enable with `plugins: { enabled: [ebay] }`.
+  install`). On a protoAgent core whose `agent_browser` plugin offers the
+  `agent_browser.client` service, the browser is driven through core's hardened client (output
+  cap, process-group kill, CLI resolution, typed timeouts and walls); on an older core, through
+  this plugin's own CLI wrapper. Same session, profile, launch options and tab either way.
+  Ships DISABLED; enable with `plugins: { enabled: [ebay] }`.
 enabled: false
 repository: https://github.com/protoLabsAI/ebay-plugin
 min_protoagent_version: "0.27.0"
@@ -55,6 +59,15 @@ config:
   history_db: ""
   # Per-command subprocess timeout (seconds).
   timeout_s: 60
+  # Per-navigation timeout (seconds). Just past agent-browser's 30 s read timeout: a navigation
+  # the browser never answers (a wedged tab) is re-sent by the CLI up to five times, so a longer
+  # wait only buys more re-sends. A timed-out navigation is retried once in a fresh tab, then
+  # reported as a timeout (never as a wall or a market finding).
+  nav_timeout_s: 35
+  # Minutes a completed eBay search is reused: a repeat of the SAME search (query, sold/active,
+  # condition) inside this window is answered from the last check, with no browser trip, and
+  # says so (`cached`). The tools' fresh=true skips it. 0 turns it off.
+  cache_ttl_min: 360
   # Minimum gap between navigations. Politeness, not evasion: it keeps a research loop from
   # hitting the site faster than a person would. Raise it if eBay starts serving challenges.
   min_interval_s: 1.5
