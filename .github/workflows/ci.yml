@@ -1,8 +1,6 @@
 name: CI
 
-# Lint + test the plugin. Runs on the org's Namespace Linux profile (not a
-# GitHub-hosted runner) to keep CI cost down. Falls back to a hosted runner on a
-# fork that lacks the profile by overriding the NSC_RUNNER repo variable.
+# Lint + test the plugin. Runs on a GitHub-hosted runner (ubuntu-latest).
 on:
   pull_request:
   push:
@@ -11,7 +9,7 @@ on:
 
 jobs:
   test:
-    runs-on: ${{ vars.NSC_RUNNER || 'namespace-profile-protolabs-linux' }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
